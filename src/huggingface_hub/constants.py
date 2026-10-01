@@ -40,6 +40,16 @@ DEFAULT_REQUEST_TIMEOUT = 10
 DOWNLOAD_CHUNK_SIZE = 10 * 1024 * 1024
 MAX_HTTP_DOWNLOAD_SIZE = 50 * 1000 * 1000 * 1000  # 50 GB
 
+# Opt-in per-block SHA-256 verification for resumable HTTP downloads.
+# When enabled, a sidecar manifest records one digest per fixed-size block of the file; on resume,
+# blocks already on disk are re-hashed and corrupted ones are re-fetched individually (HTTP Range)
+# instead of restarting the whole download. The manifest is tied to the file's ETag: if the ETag
+# changes between attempts, the partial file and its manifest are discarded.
+HF_HUB_BLOCK_CHECKSUM_ENABLED: bool = _is_true(os.environ.get("HF_HUB_BLOCK_CHECKSUM"))
+HF_HUB_BLOCK_CHECKSUM_BLOCK_SIZE: int = (
+    _as_int(os.environ.get("HF_HUB_BLOCK_CHECKSUM_BLOCK_SIZE")) or DOWNLOAD_CHUNK_SIZE
+)
+
 # Constants for serialization
 
 PYTORCH_WEIGHTS_FILE_PATTERN = "pytorch_model{suffix}.bin"  # Unsafe pickle: use safetensors instead

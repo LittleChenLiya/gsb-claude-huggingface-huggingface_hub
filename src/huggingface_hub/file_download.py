@@ -1,5 +1,6 @@
 import copy
 import errno
+import hashlib
 import os
 import re
 import shutil
@@ -17,6 +18,7 @@ import httpx2
 from tqdm import tqdm as base_tqdm
 
 from . import constants
+from ._block_checksum import BlockChecksumManifest, manifest_path_for
 from ._local_folder import (
     _create_cachedir_tag,
     _validate_relative_filename,
@@ -330,6 +332,123 @@ def _get_file_length_from_http_response(response: httpx2.Response) -> int | None
     return None
 
 
+def _init_block_manifest(
+    *,
+    temp_file: BinaryIO,
+    etag: str | None,
+    block_checksum: bool,
+    block_size: int | None,
+    block_manifest: BlockChecksumManifest | None,
+    block_manifest_path: Path | None,
+) -> tuple[BlockChecksumManifest | None, Path | None, int | None]:
+    """Load or create the per-block checksum manifest for a download.
+
+    When block checksums are enabled, a manifest is loaded from the sidecar file next to the
+    partial download. If the manifest is missing, stale, or tied to another ETag, the partial
+    bytes are discarded (truncated to 0) and a fresh manifest is started.
+
+    Returns the manifest (or None when block checksums are disabled), the sidecar path, and the
+    block size.
+    """
+    manifest = block_manifest
+    manifest_path = block_manifest_path
+    if block_checksum and manifest is None and etag is not None:
+        bs = block_size if block_size is not None else constants.HF_HUB_BLOCK_CHECKSUM_BLOCK_SIZE
+        if manifest_path is None and hasattr(temp_file, "name") and temp_file.name:
+            manifest_path = manifest_path_for(Path(temp_file.name))
+        if manifest_path is not None:
+            manifest = BlockChecksumManifest.load(manifest_path, etag=etag, block_size=bs)
+        if manifest is None:
+            # No usable manifest: the partial bytes cannot be trusted, so discard them and
+            # restart from scratch.
+            temp_file.seek(0)
+            temp_file.truncate()
+            manifest = BlockChecksumManifest(etag=etag, block_size=bs)
+    if manifest is not None and block_size is None:
+        block_size = manifest.block_size
+    return manifest, manifest_path, block_size
+
+
+def _fetch_single_block(
+    url: str,
+    temp_file: BinaryIO,
+    block_index: int,
+    manifest: BlockChecksumManifest,
+    headers: dict[str, Any] | None,
+) -> bool:
+    """Re-fetch a single corrupted block via a Range request and write it at its offset.
+
+    Returns True if the block was fetched and its digest matched the manifest. Returns False if
+    the server ignored the Range header (HTTP 200) or served bytes whose digest does not match.
+    Transient network errors propagate to the caller (which retries the whole download).
+    """
+    start = block_index * manifest.block_size
+    end = start + manifest.block_size - 1
+    block_headers = copy.deepcopy(headers) or {}
+    block_headers["Range"] = f"bytes={start}-{end}"
+    with http_stream_backoff(
+        method="GET",
+        url=url,
+        headers=block_headers,
+        timeout=constants.HF_HUB_DOWNLOAD_TIMEOUT,
+        retry_on_exceptions=(),
+        retry_on_status_codes=(408, 429),
+    ) as response:
+        hf_raise_for_status(response)
+        if response.status_code != 206:
+            # Server ignored the Range header: a surgical block fix is impossible.
+            return False
+        data = response.read()
+    if len(data) < manifest.block_size:
+        return False
+    if hashlib.sha256(data).hexdigest() != manifest.digests[block_index]:
+        logger.warning(
+            "Re-fetched block %d of '%s' still does not match its checksum; the server may be"
+            " serving corrupted bytes.",
+            block_index,
+            url,
+        )
+        return False
+    temp_file.seek(start)
+    temp_file.write(data)
+    return True
+
+
+def _verify_and_fix_blocks(
+    *,
+    url: str,
+    temp_file: BinaryIO,
+    manifest: BlockChecksumManifest,
+    headers: dict[str, Any] | None,
+    expected_size: int | None,
+) -> int:
+    """Verify a partial download block-by-block and re-fetch corrupted blocks individually.
+
+    Returns the byte offset from which the tail of the file should be resumed. Corrupted full
+    blocks are re-fetched with a Range request (only that block is re-pulled); a truncated block
+    and everything after it is left to the tail. If a corrupted block cannot be fixed (server
+    ignores Range or serves wrong bytes), the whole file is truncated and the download restarts
+    from scratch.
+    """
+    corrupted, short_start = manifest.verify_file(temp_file, expected_size)
+    tail_start = manifest.verified_size
+    if short_start is not None:
+        tail_start = min(tail_start, short_start * manifest.block_size)
+    for block_index in corrupted:
+        if not _fetch_single_block(url, temp_file, block_index, manifest, headers):
+            logger.warning(
+                "Could not re-fetch corrupted block %d of '%s'; restarting the download from scratch.",
+                block_index,
+                url,
+            )
+            temp_file.seek(0)
+            temp_file.truncate()
+            manifest.reset()
+            return 0
+    temp_file.flush()
+    return tail_start
+
+
 @validate_hf_hub_args
 def http_get(
     url: str,
@@ -342,6 +461,11 @@ def http_get(
     tqdm_class: type[base_tqdm] | None = None,
     _nb_retries: int = 5,
     _tqdm_bar: base_tqdm | None = None,
+    etag: str | None = None,
+    block_checksum: bool = False,
+    block_size: int | None = None,
+    _block_manifest: BlockChecksumManifest | None = None,
+    _block_manifest_path: Path | None = None,
 ) -> None:
     """
     Download a remote file. Do not gobble up errors, and will return errors tailored to the Hugging Face Hub.
@@ -367,10 +491,62 @@ def http_get(
         displayed_filename (`str`, *optional*):
             The filename of the file that is being downloaded. Value is used only to display a nice progress bar. If
             not set, the filename is guessed from the URL or the `Content-Disposition` header.
+        etag (`str`, *optional*):
+            ETag of the file being downloaded. Used to detect that the remote file changed between attempts, in which
+            case the partial bytes are discarded and the download restarts from scratch.
+        block_checksum (`bool`, *optional*, defaults to `False`):
+            Whether to verify (and persist) per-block SHA-256 digests. When enabled, a resume re-hashes the blocks
+            already on disk, re-fetches corrupted blocks individually (HTTP Range), and discards everything if the
+            ETag changed.
     """
+    # --- Block checksum manifest (opt-in) ---
+    manifest, manifest_path, block_size = _init_block_manifest(
+        temp_file=temp_file,
+        etag=etag,
+        block_checksum=block_checksum,
+        block_size=block_size,
+        block_manifest=_block_manifest,
+        block_manifest_path=_block_manifest_path,
+    )
+
     if expected_size is not None and resume_size == expected_size:
-        # If the file is already fully downloaded, we don't need to download it again.
-        return
+        # The file is already fully downloaded. With block checksums, verify it first: a complete-looking
+        # file with corrupted blocks must be re-fetched, not moved into the cache.
+        if manifest is not None and resume_size > 0:
+            try:
+                tail_start = _verify_and_fix_blocks(
+                    url=url,
+                    temp_file=temp_file,
+                    manifest=manifest,
+                    headers=copy.deepcopy(headers) or {},
+                    expected_size=expected_size,
+                )
+            except (httpx2.ConnectError, httpx2.TimeoutException, httpx2.RemoteProtocolError) as e:
+                if _nb_retries <= 0:
+                    raise
+                logger.warning("Error while verifying blocks of %s: %s\nTrying to resume download...", url, str(e))
+                time.sleep(1)
+                return http_get(
+                    url=url,
+                    temp_file=temp_file,
+                    resume_size=resume_size,
+                    headers=headers,
+                    expected_size=expected_size,
+                    tqdm_class=tqdm_class,
+                    _nb_retries=_nb_retries - 1,
+                    _tqdm_bar=_tqdm_bar,
+                    etag=etag,
+                    block_checksum=block_checksum,
+                    block_size=block_size,
+                    _block_manifest=manifest,
+                    _block_manifest_path=manifest_path,
+                )
+            if tail_start == expected_size:
+                return
+            # Could not verify/fix: restart from scratch.
+            resume_size = tail_start
+        else:
+            return
 
     initial_headers = headers
     headers = copy.deepcopy(headers) or {}
@@ -387,7 +563,29 @@ def http_get(
     with ExitStack() as stack:
         progress = _tqdm_bar
         new_resume_size = resume_size
+        response = None
+        is_encoded = False
         try:
+            # Block checksum: verify the bytes already on disk and re-fetch corrupted blocks individually
+            # before resuming the tail. Transient errors propagate to the retry handler below.
+            if manifest is not None and resume_size > 0:
+                tail_start = _verify_and_fix_blocks(
+                    url=url,
+                    temp_file=temp_file,
+                    manifest=manifest,
+                    headers=headers,
+                    expected_size=expected_size,
+                )
+                if tail_start < resume_size and _tqdm_bar is not None:
+                    # Bytes [tail_start, resume_size) are re-downloaded: roll the progress bar back so it
+                    # does not double-count them.
+                    _tqdm_bar.update(-(resume_size - tail_start))
+                    if callable(update_transfer := getattr(_tqdm_bar, "update_transfer", None)):
+                        update_transfer(-(resume_size - tail_start))
+                resume_size = tail_start
+                new_resume_size = tail_start
+                temp_file.seek(tail_start)
+
             response = stack.enter_context(
                 http_stream_backoff(
                     method="GET",
@@ -414,7 +612,32 @@ def http_get(
                     _tqdm_bar.update(-resume_size)
                     if callable(update_transfer := getattr(_tqdm_bar, "update_transfer", None)):
                         update_transfer(-resume_size)
+                if manifest is not None:
+                    manifest.reset()
                 resume_size = 0
+                new_resume_size = 0
+
+            # ETag changed on the server between attempts: the partial bytes belong to another version, so
+            # they must be discarded and the download restarted from scratch.
+            if manifest is not None and etag is not None and resume_size > 0:
+                response_etag = _normalize_etag(response.headers.get("ETag"))
+                if response_etag is not None and response_etag != etag:
+                    logger.warning(
+                        "ETag changed while downloading '%s' (%s -> %s); discarding partial download and"
+                        " restarting from scratch.",
+                        url,
+                        etag,
+                        response_etag,
+                    )
+                    temp_file.seek(0)
+                    temp_file.truncate()
+                    if _tqdm_bar is not None:
+                        _tqdm_bar.update(-resume_size)
+                        if callable(update_transfer := getattr(_tqdm_bar, "update_transfer", None)):
+                            update_transfer(-resume_size)
+                    manifest.reset()
+                    resume_size = 0
+                    new_resume_size = 0
 
             total: int | None = _get_file_length_from_http_response(response)
             if expected_size is None:
@@ -456,22 +679,86 @@ def http_get(
 
             progress = stack.enter_context(progress_cm)
             new_resume_size = resume_size
-            for chunk in response.iter_bytes(chunk_size=constants.DOWNLOAD_CHUNK_SIZE):
-                if chunk:  # filter out keep-alive new chunks
-                    progress.update(len(chunk))
-                    if callable(update_transfer := getattr(progress, "update_transfer", None)):
-                        update_transfer(len(chunk))
-                    temp_file.write(chunk)
-                    new_resume_size += len(chunk)
-                    # Some data has been downloaded from the server so we reset the number of retries.
-                    _nb_retries = 5
+            # Use `iter_raw` for unencoded content so that if the stream drops mid-body, the bytes
+            # already received are still accounted for (the retry's Range header depends on it).
+            # `iter_bytes` buffers decoded bytes in a chunker and loses them when the stream raises.
+            content_encoding = (response.headers.get("Content-Encoding") or "").lower()
+            is_encoded = content_encoding not in ("", "identity")
+            # If the response was created with `content=...` (e.g. in tests), the body is already
+            # loaded into memory; `iter_raw` would raise `StreamConsumed` in that case. Fall back to
+            # `iter_bytes`, which yields from the pre-loaded content directly.
+            is_preloaded = hasattr(response, "_content")
+            if is_encoded or is_preloaded:
+                # Encoded content (e.g. gzip text files): fall back to `iter_bytes` which handles
+                # decoding. Resume is not supported for encoded content (Range on a gzip stream is
+                # not meaningful), so `resume_size` stays 0.
+                for chunk in response.iter_bytes(chunk_size=constants.DOWNLOAD_CHUNK_SIZE):
+                    if chunk:  # filter out keep-alive new chunks
+                        progress.update(len(chunk))
+                        if callable(update_transfer := getattr(progress, "update_transfer", None)):
+                            update_transfer(len(chunk))
+                        temp_file.write(chunk)
+                        new_resume_size += len(chunk)
+                        if manifest is not None:
+                            prev_blocks = len(manifest.digests)
+                            manifest.observe(chunk)
+                            if manifest_path is not None and len(manifest.digests) > prev_blocks:
+                                # Persist the manifest whenever a new block is recorded, so a later attempt
+                                # (e.g. after a crash) can verify the bytes already on disk.
+                                manifest.save(manifest_path)
+                        # Some data has been downloaded from the server so we reset the number of retries.
+                        _nb_retries = 5
+            else:
+                # `chunk_size=None` yields each raw chunk as-is from the stream (no buffering in the
+                # ByteChunker), so that if the stream drops mid-body the bytes already received are
+                # accounted for — both in `new_resume_size` (for the retry's Range header) and in the
+                # block-checksum manifest (for per-block verification). Using a large `chunk_size`
+                # would buffer the bytes and lose them when the stream raises.
+                for chunk in response.iter_raw(chunk_size=None):
+                    if chunk:  # filter out keep-alive new chunks
+                        progress.update(len(chunk))
+                        if callable(update_transfer := getattr(progress, "update_transfer", None)):
+                            update_transfer(len(chunk))
+                        temp_file.write(chunk)
+                        new_resume_size += len(chunk)
+                        if manifest is not None:
+                            prev_blocks = len(manifest.digests)
+                            manifest.observe(chunk)
+                            if manifest_path is not None and len(manifest.digests) > prev_blocks:
+                                # Persist the manifest whenever a new block is recorded, so a later attempt
+                                # (e.g. after a crash) can verify the bytes already on disk.
+                                manifest.save(manifest_path)
+                        # Some data has been downloaded from the server so we reset the number of retries.
+                        _nb_retries = 5
+            if manifest is not None:
+                manifest.finish()
+                if manifest_path is not None:
+                    manifest.save(manifest_path)
         except (httpx2.ConnectError, httpx2.TimeoutException, httpx2.RemoteProtocolError) as e:
             # Retry transient failures both when opening the stream and while reading its body.
+            if response is not None and not is_encoded:
+                # The stream dropped mid-body: account for the bytes actually received (including
+                # bytes buffered in the chunker that were never yielded). Without this, the retry's
+                # Range header would start from 0 and re-download the whole file.
+                num_bytes = getattr(response, "_num_bytes_downloaded", 0)
+                if isinstance(num_bytes, int):
+                    new_resume_size = resume_size + num_bytes
             if _nb_retries <= 0:
                 logger.warning("Error while downloading from %s: %s\nMax retries exceeded.", url, str(e))
+                if manifest is not None and manifest_path is not None:
+                    try:
+                        manifest.finish()
+                        manifest.save(manifest_path)
+                    except OSError:
+                        pass
                 raise
             logger.warning("Error while downloading from %s: %s\nTrying to resume download...", url, str(e))
             time.sleep(1)
+            if manifest is not None and manifest_path is not None:
+                try:
+                    manifest.save(manifest_path)
+                except OSError:
+                    pass
             return http_get(
                 url=url,
                 temp_file=temp_file,
@@ -483,6 +770,11 @@ def http_get(
                 # Reuse the existing progress bar across retries so a custom `tqdm_class` (e.g. snapshot_download's `_AggregatedTqdm`,
                 # which mutates a shared parent bar in `__init__`) is not re-instantiated and does not double-count `total`/`initial`.
                 _tqdm_bar=progress,
+                etag=etag,
+                block_checksum=block_checksum,
+                block_size=block_size,
+                _block_manifest=manifest,
+                _block_manifest_path=manifest_path,
             )
 
     # Compare against the bytes downloaded by this call rather than the absolute file position: the two differ
@@ -1982,9 +2274,16 @@ def _download_to_tmp_and_move(
     Internal logic:
     - return early if file is already downloaded
     - check disk space before downloading
-    - download content to a process-unique temporary file
+    - download content to a temporary file (process-unique by default; a deterministic per-ETag
+      name when block checksums are enabled so a later attempt can resume the partial file)
     - set correct permissions on temporary file
     - move the temporary file to the destination path
+
+    When block checksums are enabled (``HF_HUB_BLOCK_CHECKSUM=1``), a sidecar manifest records one
+    SHA-256 digest per fixed-size block. On failure the partial file and its manifest are kept for a
+    future resume attempt; they are never moved to the destination, so a failed download is never
+    mistaken for a completed cache entry. If the ETag changed between attempts, the partial file and
+    its manifest are discarded and the download restarts from scratch.
 
     Both `incomplete_path` and `destination_path` must be on the same volume to avoid a local copy.
     """
@@ -1992,18 +2291,44 @@ def _download_to_tmp_and_move(
         # Do nothing if already exists (except if force_download=True)
         return
 
-    # Download to a process-unique temporary file before moving it in place. A shared
-    # `<etag>.incomplete` file corrupts the cache whenever the surrounding lock is not honored:
-    # on some filesystems (Lustre, GPFS, some NFS mounts) `flock(2)` silently succeeds for every
-    # caller and concurrent processes end up appending to the same file. With a unique file per
-    # process, a broken lock costs only duplicated bandwidth: each process downloads the full
-    # file and atomically renames it to the final destination.
-    # See https://github.com/huggingface/huggingface_hub/pull/4228.
-    # Re-check the length on Windows: the suffix can push a path just under the limit above MAX_PATH.
-    tmp_path = incomplete_path.with_name(f"{incomplete_path.stem}.{uuid.uuid4().hex[:8]}.incomplete")
-    tmp_path = Path(as_extended_path(tmp_path))
+    is_xet = xet_file_data is not None and is_xet_available()
+    # Block checksums only apply to the regular HTTP download path; Xet verifies content hashes itself.
+    block_checksum = constants.HF_HUB_BLOCK_CHECKSUM_ENABLED and not is_xet
+    block_size = constants.HF_HUB_BLOCK_CHECKSUM_BLOCK_SIZE if block_checksum else None
+
+    manifest: BlockChecksumManifest | None = None
+    manifest_path: Path | None = None
+
+    if block_checksum and etag is not None:
+        # Deterministic name per ETag so a later attempt can resume the partial file. The surrounding
+        # download lock serializes concurrent attempts for the same file.
+        tmp_path = incomplete_path
+        manifest_path = manifest_path_for(tmp_path)
+        manifest = BlockChecksumManifest.load(manifest_path, etag=etag, block_size=block_size)
+        if manifest is None or force_download:
+            # Stale manifest / ETag changed / forced re-download => discard old fragments.
+            tmp_path.unlink(missing_ok=True)
+            manifest_path.unlink(missing_ok=True)
+            manifest = BlockChecksumManifest(etag=etag, block_size=block_size)
+        tmp_path = Path(as_extended_path(tmp_path))
+        mode = "r+b" if tmp_path.exists() else "w+b"
+        resume_size = tmp_path.stat().st_size if tmp_path.exists() else 0
+    else:
+        # Download to a process-unique temporary file before moving it in place. A shared
+        # `<etag>.incomplete` file corrupts the cache whenever the surrounding lock is not honored:
+        # on some filesystems (Lustre, GPFS, some NFS mounts) `flock(2)` silently succeeds for every
+        # caller and concurrent processes end up appending to the same file. With a unique file per
+        # process, a broken lock costs only duplicated bandwidth: each process downloads the full
+        # file and atomically renames it to the final destination.
+        # See https://github.com/huggingface/huggingface_hub/pull/4228.
+        # Re-check the length on Windows: the suffix can push a path just under the limit above MAX_PATH.
+        tmp_path = incomplete_path.with_name(f"{incomplete_path.stem}.{uuid.uuid4().hex[:8]}.incomplete")
+        tmp_path = Path(as_extended_path(tmp_path))
+        mode = "wb"
+        resume_size = 0
+
     try:
-        with tmp_path.open("wb") as f:
+        with tmp_path.open(mode) as f:
             logger.debug(f"Downloading '{filename}' to '{tmp_path}'")
 
             if expected_size is not None:  # might be None if HTTP header not set correctly
@@ -2011,7 +2336,7 @@ def _download_to_tmp_and_move(
                 _check_disk_space(expected_size, tmp_path.parent)
                 _check_disk_space(expected_size, destination_path.parent)
 
-            if xet_file_data is not None and is_xet_available():
+            if is_xet:
                 logger.debug("Xet Storage is enabled for this repo. Downloading file from Xet Storage..")
                 xet_get(
                     incomplete_path=tmp_path,
@@ -2035,14 +2360,31 @@ def _download_to_tmp_and_move(
                     headers=headers,
                     expected_size=expected_size,
                     tqdm_class=tqdm_class,
+                    resume_size=resume_size,
+                    etag=etag,
+                    block_checksum=block_checksum,
+                    block_size=block_size,
+                    _block_manifest=manifest,
+                    _block_manifest_path=manifest_path,
                 )
 
         logger.debug(f"Download complete. Moving file to {destination_path}")
+        if manifest is not None:
+            manifest.finish()
+            manifest.save(manifest_path)
         _chmod_and_move(tmp_path, destination_path)
+        if manifest_path is not None:
+            # The blob is in place: the sidecar is no longer needed.
+            manifest_path.unlink(missing_ok=True)
     finally:
-        # No-op on success (file has been moved). On failure, do not keep a partial file around:
-        # it could not be reused anyway since the temporary name is unique to this download.
-        tmp_path.unlink(missing_ok=True)
+        if block_checksum:
+            # Keep the partial file + manifest for a future resume attempt. They are never moved to the
+            # destination blob, so a failed download is never mistaken for a completed cache entry.
+            pass
+        else:
+            # No-op on success (file has been moved). On failure, do not keep a partial file around:
+            # it could not be reused anyway since the temporary name is unique to this download.
+            tmp_path.unlink(missing_ok=True)
 
 
 def _int_or_none(value: str | None) -> int | None:
