@@ -1,5 +1,7 @@
 import copy
 import errno
+import hashlib
+import io
 import os
 import re
 import shutil
@@ -340,8 +342,12 @@ def http_get(
     expected_size: int | None = None,
     displayed_filename: str | None = None,
     tqdm_class: type[base_tqdm] | None = None,
+    block_checksums: tuple[str, ...] | list[str] | None = None,
+    block_size: int | None = None,
+    expected_etag: str | None = None,
     _nb_retries: int = 5,
     _tqdm_bar: base_tqdm | None = None,
+    _baseline_etag: str | None = None,
 ) -> None:
     """
     Download a remote file. Do not gobble up errors, and will return errors tailored to the Hugging Face Hub.
@@ -367,9 +373,36 @@ def http_get(
         displayed_filename (`str`, *optional*):
             The filename of the file that is being downloaded. Value is used only to display a nice progress bar. If
             not set, the filename is guessed from the URL or the `Content-Disposition` header.
+        block_checksums (`tuple` or `list` of `str`, *optional*):
+            Optional SHA-256 digests (hex-encoded), one per fixed-size block of the file, enabling integrity
+            verification of a resumable download. When provided together with `block_size`, every block of the file
+            is verified after the transfer and a corrupted block is re-downloaded individually (with a ranged
+            request) instead of re-downloading the whole file. Must cover exactly `expected_size` bytes (the last
+            block can be shorter).
+        block_size (`int`, *optional*):
+            Size in bytes of each block listed in `block_checksums`. All blocks have this size except the last one,
+            which can be shorter. Required if `block_checksums` is provided.
+        expected_etag (`str`, *optional*):
+            Normalized ETag of the resource being downloaded. When resuming (`resume_size > 0`), if the server
+            response advertises a different ETag, the partially downloaded content is stale: it is discarded and
+            the file is downloaded again from scratch. On the first GET of a download, the response ETag is
+            adopted as the baseline (a Hub HEAD ETag can legitimately differ from the ETag served by a CDN on
+            the GET, e.g. an xet-bridge URL); only subsequent resume GETs are compared against it.
     """
+    block_checksums = _validate_block_checksums(block_checksums, block_size, expected_size, resume_size)
+
     if expected_size is not None and resume_size == expected_size:
-        # If the file is already fully downloaded, we don't need to download it again.
+        # If the file is already fully downloaded, verify it before returning.
+        if block_checksums is not None:
+            _verify_and_repair_blocks(
+                url=url,
+                temp_file=temp_file,
+                headers=headers,
+                expected_size=expected_size,
+                block_checksums=block_checksums,
+                block_size=cast(int, block_size),
+                expected_etag=_baseline_etag if _baseline_etag is not None else expected_etag,
+            )
         return
 
     initial_headers = headers
@@ -400,6 +433,52 @@ def http_get(
             )
             hf_raise_for_status(response)
 
+            # ETag guard for resumable downloads.
+            #
+            # - On the first GET of a *fresh* download (`resume_size == 0`, `_baseline_etag is None`), adopt the
+            #   response ETag as the baseline. The Hub's HEAD ETag (`expected_etag`) can legitimately differ from
+            #   the ETag served on the GET (e.g. an xet-bridge/CDN URL serves its own hash), so it must not be
+            #   compared on a fresh GET.
+            # - On a GET that resumes bytes already present before this download started (`resume_size > 0` and no
+            #   baseline was established by this process yet), the response ETag must match `expected_etag`: a
+            #   mismatch means the on-disk prefix belongs to an outdated version and must be discarded.
+            # - On subsequent in-process resume GETs (`_baseline_etag` set), compare against that baseline.
+            response_etag = _normalize_etag(response.headers.get("ETag"))
+            if response_etag is not None:
+                reference_etag = _baseline_etag
+                if reference_etag is None and resume_size > 0:
+                    reference_etag = expected_etag
+                if reference_etag is not None and response_etag != reference_etag:
+                    logger.warning(
+                        "ETag of '%s' changed (was '%s', now '%s'). Discarding partially downloaded file and"
+                        " downloading it again from scratch.",
+                        url,
+                        reference_etag,
+                        response_etag,
+                    )
+                    temp_file.seek(0)
+                    temp_file.truncate()
+                    if _tqdm_bar is not None:
+                        _tqdm_bar.update(-resume_size)
+                        if callable(update_transfer := getattr(_tqdm_bar, "update_transfer", None)):
+                            update_transfer(-resume_size)
+                    return http_get(
+                        url=url,
+                        temp_file=temp_file,
+                        resume_size=0,
+                        headers=initial_headers,
+                        expected_size=None,  # size of the new version is unknown yet, take it from the response
+                        tqdm_class=tqdm_class,
+                        block_checksums=None,  # checksums of the old version are stale
+                        block_size=block_size,
+                        expected_etag=expected_etag,
+                        _nb_retries=_nb_retries,
+                        _tqdm_bar=progress,
+                        _baseline_etag=response_etag,
+                    )
+                # Pin the baseline for subsequent in-process resume GETs.
+                _baseline_etag = response_etag
+
             # If we requested a Range but got 200 back, the server ignored our Range header
             # (e.g. CloudFront with Accept-Encoding: gzip). Reset file to avoid corruption.
             if resume_size > 0 and response.status_code == 200:
@@ -425,6 +504,11 @@ def http_get(
                 # `expected_size` (always known from the metadata HEAD on the hf_hub path) so the progress bar, and any
                 # aggregating wrapper such as snapshot_download's `_AggregatedTqdm` — still sees the file size.
                 total = expected_size
+
+            # If the server actually serves a file of a different size than the one the checksums were computed
+            # for, block verification cannot apply. Skip it rather than raising on a perfectly valid download.
+            if block_checksums is not None and total is not None and total != expected_size:
+                block_checksums = None
 
             if displayed_filename is None:
                 displayed_filename = url
@@ -479,10 +563,14 @@ def http_get(
                 headers=initial_headers,
                 expected_size=expected_size,
                 tqdm_class=tqdm_class,
+                block_checksums=block_checksums,
+                block_size=block_size,
+                expected_etag=expected_etag,
                 _nb_retries=_nb_retries - 1,
                 # Reuse the existing progress bar across retries so a custom `tqdm_class` (e.g. snapshot_download's `_AggregatedTqdm`,
                 # which mutates a shared parent bar in `__init__`) is not re-instantiated and does not double-count `total`/`initial`.
                 _tqdm_bar=progress,
+                _baseline_etag=_baseline_etag,
             )
 
     # Compare against the bytes downloaded by this call rather than the absolute file position: the two differ
@@ -493,6 +581,161 @@ def http_get(
                 actual_size=new_resume_size,
             )
         )
+
+    # Full download reached the expected size: verify every block and re-download only the corrupted ones.
+    if block_checksums is not None:
+        _verify_and_repair_blocks(
+            url=url,
+            temp_file=temp_file,
+            headers=initial_headers,
+            expected_size=cast(int, expected_size),
+            block_checksums=block_checksums,
+            block_size=cast(int, block_size),
+            expected_etag=_baseline_etag if _baseline_etag is not None else expected_etag,
+        )
+
+
+def _validate_block_checksums(
+    block_checksums: tuple[str, ...] | list[str] | None,
+    block_size: int | None,
+    expected_size: int | None,
+    resume_size: int,
+) -> tuple[str, ...] | None:
+    """Validate the optional per-block checksums arguments and return them as a tuple (or `None`).
+
+    Checksums are dropped (verification disabled) when the file size is unknown, since there is no way to check
+    the number of blocks in that case. A provided `block_size` without checksums is simply ignored. Mismatched or
+    malformed arguments raise a `ValueError`.
+    """
+    if block_checksums is None:
+        return None
+    if block_size is None or block_size <= 0:
+        raise ValueError("`block_size` must be a positive integer when `block_checksums` is provided.")
+    if not isinstance(block_checksums, (tuple, list)) or len(block_checksums) == 0:
+        raise ValueError("`block_checksums` must be a non-empty tuple/list of hex-encoded SHA-256 digests.")
+    normalized = tuple(digest.lower() for digest in block_checksums)
+    for digest in normalized:
+        if not REGEX_SHA256.fullmatch(digest):
+            raise ValueError(f"Invalid block checksum: {digest!r} must be a 64-character hex-encoded SHA-256 digest.")
+    if expected_size is None:
+        logger.info("Cannot verify block checksums when the expected file size is unknown. Verification is disabled.")
+        return None
+    expected_nb_blocks = (expected_size + block_size - 1) // block_size
+    if len(normalized) != expected_nb_blocks:
+        raise ValueError(
+            f"Invalid block checksums: got {len(normalized)} block(s) of size {block_size} but file size is"
+            f" {expected_size} ({expected_nb_blocks} block(s) expected)."
+        )
+    if resume_size < 0:
+        raise ValueError("`resume_size` must be a positive integer.")
+    return normalized
+
+
+def _download_block(
+    url: str,
+    headers: dict[str, Any] | None,
+    start: int,
+    end: int,
+    expected_etag: str | None,
+    *,
+    _nb_retries: int = 3,
+) -> bytes:
+    """Download a single byte range `[start, end]` from `url` and return its exact content.
+
+    Raises `OSError` if the server does not serve exactly the requested range. Transient network errors are
+    retried with the same exponential-less retry loop as `http_get`.
+    """
+    range_headers = copy.deepcopy(headers) or {}
+    range_headers["Range"] = f"bytes={start}-{end - 1}"
+    try:
+        with http_stream_backoff(
+            method="GET",
+            url=url,
+            headers=range_headers,
+            timeout=constants.HF_HUB_DOWNLOAD_TIMEOUT,
+            retry_on_exceptions=(),
+        ) as response:
+            hf_raise_for_status(response)
+            if response.status_code != 206:
+                raise OSError(
+                    f"Cannot re-download corrupted block [bytes {start}-{end - 1}]: server returned status"
+                    f" {response.status_code} instead of 206 Partial Content."
+                )
+            response_etag = _normalize_etag(response.headers.get("ETag"))
+            if expected_etag is not None and response_etag is not None and response_etag != expected_etag:
+                raise FileMetadataError(
+                    f"Cannot repair corrupted block: ETag changed since download started (was '{expected_etag}',"
+                    f" now '{response_etag}'). Please retry the download."
+                )
+            content = b"".join(response.iter_bytes(chunk_size=constants.DOWNLOAD_CHUNK_SIZE))
+        if len(content) != end - start:
+            raise OSError(f"Corrupted block re-download returned {len(content)} bytes instead of {end - start}.")
+        return content
+    except (httpx2.ConnectError, httpx2.TimeoutException, httpx2.RemoteProtocolError) as e:
+        if _nb_retries <= 0:
+            raise
+        logger.warning("Error while re-downloading corrupted block from %s: %s\nRetrying...", url, str(e))
+        time.sleep(1)
+        return _download_block(url, headers, start, end, expected_etag, _nb_retries=_nb_retries - 1)
+
+
+def _verify_and_repair_blocks(
+    *,
+    url: str,
+    temp_file: BinaryIO,
+    headers: dict[str, Any] | None,
+    expected_size: int,
+    block_checksums: tuple[str, ...],
+    block_size: int,
+    expected_etag: str | None,
+) -> None:
+    """Verify every block of the downloaded file and individually re-download corrupted blocks.
+
+    Blocks are read back from `temp_file` (so disk corruption is detected as well) and compared to the expected
+    SHA-256 digests. A block that fails verification is re-fetched with a single ranged request and written back
+    in place. If a corrupted block still does not match after re-downloading, an `OSError` is raised.
+    """
+    initial_position = temp_file.tell()
+    nb_blocks = len(block_checksums)
+    try:
+        temp_file.seek(0)
+    except (AttributeError, OSError, io.UnsupportedOperation) as e:
+        raise ValueError(
+            "Block verification requires a seekable, readable file object; the provided `temp_file` is not."
+        ) from e
+    try:
+        for block_index in range(nb_blocks):
+            start = block_index * block_size
+            end = min(start + block_size, expected_size)
+            temp_file.seek(start)
+            block_data = temp_file.read(end - start)
+            actual_digest = hashlib.sha256(block_data).hexdigest()
+            if actual_digest == block_checksums[block_index]:
+                continue
+            logger.warning(
+                "Block %s/%s of '%s' is corrupted (expected SHA-256 %s, got %s)."
+                " Re-downloading only this block [bytes %s-%s]...",
+                block_index + 1,
+                nb_blocks,
+                url,
+                block_checksums[block_index],
+                actual_digest,
+                start,
+                end - 1,
+            )
+            block_data = _download_block(url, headers, start, end, expected_etag)
+            repaired_digest = hashlib.sha256(block_data).hexdigest()
+            if repaired_digest != block_checksums[block_index]:
+                raise OSError(
+                    f"Consistency check failed: block {block_index + 1}/{nb_blocks} [bytes {start}-{end - 1}]"
+                    f" of '{url}' is corrupted after re-download (expected SHA-256"
+                    f" {block_checksums[block_index]}, got {repaired_digest}). Please retry with"
+                    " `force_download=True`."
+                )
+            temp_file.seek(start)
+            temp_file.write(block_data)
+    finally:
+        temp_file.seek(initial_position)
 
 
 def xet_get(
@@ -2003,7 +2246,7 @@ def _download_to_tmp_and_move(
     tmp_path = incomplete_path.with_name(f"{incomplete_path.stem}.{uuid.uuid4().hex[:8]}.incomplete")
     tmp_path = Path(as_extended_path(tmp_path))
     try:
-        with tmp_path.open("wb") as f:
+        with tmp_path.open("w+b") as f:
             logger.debug(f"Downloading '{filename}' to '{tmp_path}'")
 
             if expected_size is not None:  # might be None if HTTP header not set correctly
@@ -2035,8 +2278,12 @@ def _download_to_tmp_and_move(
                     headers=headers,
                     expected_size=expected_size,
                     tqdm_class=tqdm_class,
+                    expected_etag=etag,
                 )
 
+        # Reaching this point means the download finished without raising. Only then is the file allowed to become
+        # the cached blob: any error above skips the move and the `finally` block below removes the partial temp
+        # file, so a failed transfer is never observable as a completed (and potentially corrupt) cache entry.
         logger.debug(f"Download complete. Moving file to {destination_path}")
         _chmod_and_move(tmp_path, destination_path)
     finally:
