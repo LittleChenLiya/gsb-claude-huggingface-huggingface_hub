@@ -613,6 +613,7 @@ _SUBMOD_ATTRS = {
         "DeleteCacheStrategy",
         "HFCacheInfo",
         "HfUri",
+        "ProtectedBlobInfo",
         "cached_assets_path",
         "close_session",
         "dump_environment_info",
@@ -1098,6 +1099,7 @@ __all__ = [
     "push_to_hub_fastai",
     "read_dduf_file",
     "read_paper",
+    "read_snapshot_manifest",
     "reject_access_request",
     "rename_discussion",
     "repo_exists",
@@ -1801,6 +1803,7 @@ if TYPE_CHECKING:  # pragma: no cover
         DeleteCacheStrategy,  # noqa: F401
         HFCacheInfo,  # noqa: F401
         HfUri,  # noqa: F401
+        ProtectedBlobInfo,  # noqa: F401
         cached_assets_path,  # noqa: F401
         close_session,  # noqa: F401
         dump_environment_info,  # noqa: F401

@@ -7,8 +7,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from huggingface_hub import CommitOperationAdd, HfApi, ResolvedRevision, hf_hub_download, snapshot_download
+from huggingface_hub._snapshot_manifest import read_snapshot_manifest
 from huggingface_hub._tree_cache import read_tree_cache
 from huggingface_hub.errors import (
+    HfHubHTTPError,
     IncompleteSnapshotError,
     LocalEntryNotFoundError,
     RepositoryNotFoundError,
@@ -44,6 +46,87 @@ def test_tree_with_redacted_xet_hash_is_not_cached(tmp_path: Path):
 
     storage_folder = tmp_path / repo_folder_name(repo_id="user/repo", repo_type="model")
     assert read_tree_cache(str(storage_folder), COMMIT_HASH) is None
+
+
+def test_snapshot_manifest_written_on_failure_and_cleared_on_resume(tmp_path: Path):
+    """A failed snapshot download writes a manifest; resume skips successes and retries failures."""
+    files = ["config.json", "weights.bin", "tokenizer.json"]
+    repo_files = [RepoFile(path=path, size=10, oid=f"blob-{path}") for path in files]
+    download_attempts = {name: 0 for name in files}
+
+    storage_folder = tmp_path / repo_folder_name(repo_id="user/repo", repo_type="model")
+    snapshot_folder = storage_folder / "snapshots" / COMMIT_HASH
+
+    def fake_hf_hub_download(*args, **kwargs):
+        filename = kwargs["filename"]
+        download_attempts[filename] += 1
+        if filename == "weights.bin" and download_attempts[filename] == 1:
+            raise HfHubHTTPError("500 Server Error: simulated failure", response=MagicMock())
+        snapshot_folder.mkdir(parents=True, exist_ok=True)
+        local_file = snapshot_folder / filename
+        local_file.write_bytes(b"fake content")
+        return str(local_file)
+
+    with (
+        patch("huggingface_hub._snapshot_download.HfApi.repo_info", return_value=MagicMock(sha=COMMIT_HASH)),
+        patch("huggingface_hub._snapshot_download.HfApi.list_repo_tree", return_value=repo_files),
+        patch("huggingface_hub._snapshot_download.hf_hub_download", side_effect=fake_hf_hub_download),
+    ):
+        # First run: weights.bin fails -> HfHubHTTPError raised with the manifest attached.
+        with pytest.raises(HfHubHTTPError) as exc_info:
+            snapshot_download("user/repo", cache_dir=tmp_path)
+        manifest = getattr(exc_info.value, "snapshot_manifest", None)
+        assert manifest is not None
+        assert set(manifest.successful_files) == {"config.json", "tokenizer.json"}
+        assert set(manifest.failed_files) == {"weights.bin"}
+        failed_status = manifest.failed_files["weights.bin"]
+        assert failed_status.error_type == "HfHubHTTPError"
+        assert "500" in (failed_status.error or "")
+
+        # Manifest is also written to disk, next to the tree listing.
+        on_disk = read_snapshot_manifest(str(storage_folder), COMMIT_HASH)
+        assert on_disk is not None
+        assert set(on_disk.successful_files) == {"config.json", "tokenizer.json"}
+        assert set(on_disk.failed_files) == {"weights.bin"}
+
+        # Second run (resume): successes are skipped, the failed file is retried, manifest is deleted.
+        result = snapshot_download("user/repo", cache_dir=tmp_path)
+        assert result == str(snapshot_folder)
+        assert read_snapshot_manifest(str(storage_folder), COMMIT_HASH) is None
+
+    assert download_attempts == {"config.json": 1, "weights.bin": 2, "tokenizer.json": 1}
+
+
+def test_snapshot_manifest_marks_incomplete_offline(tmp_path: Path):
+    """A snapshot with a failed manifest is not returned as complete when the Hub cannot be reached."""
+    files = ["config.json", "weights.bin"]
+    repo_files = [RepoFile(path=path, size=10, oid=f"blob-{path}") for path in files]
+
+    storage_folder = tmp_path / repo_folder_name(repo_id="user/repo", repo_type="model")
+    snapshot_folder = storage_folder / "snapshots" / COMMIT_HASH
+
+    def fake_hf_hub_download(*args, **kwargs):
+        filename = kwargs["filename"]
+        if filename == "weights.bin":
+            raise HfHubHTTPError("500 Server Error: simulated failure", response=MagicMock())
+        snapshot_folder.mkdir(parents=True, exist_ok=True)
+        (snapshot_folder / filename).write_bytes(b"fake content")
+        return str(snapshot_folder / filename)
+
+    with (
+        patch("huggingface_hub._snapshot_download.HfApi.repo_info", return_value=MagicMock(sha=COMMIT_HASH)),
+        patch("huggingface_hub._snapshot_download.HfApi.list_repo_tree", return_value=repo_files),
+        patch("huggingface_hub._snapshot_download.hf_hub_download", side_effect=fake_hf_hub_download),
+    ):
+        with pytest.raises(HfHubHTTPError):
+            snapshot_download("user/repo", cache_dir=tmp_path)
+
+    # Offline re-run must raise IncompleteSnapshotError (manifest has failures) instead of returning the folder.
+    for offline_mode in OfflineSimulationMode:
+        with offline(mode=offline_mode):
+            with pytest.raises(IncompleteSnapshotError) as exc_info:
+                snapshot_download("user/repo", cache_dir=tmp_path)
+            assert exc_info.value.snapshot_path == str(snapshot_folder)
 
 
 class TestSnapshotDownload:
