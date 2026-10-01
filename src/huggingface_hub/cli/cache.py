@@ -31,6 +31,7 @@ from ..utils import (
     CachedRepoInfo,
     CachedRevisionInfo,
     CacheNotFound,
+    DeleteCacheStrategy,
     HFCacheInfo,
     HfUri,
     _format_size,
@@ -140,6 +141,20 @@ def print_cache_selected_revisions(selected_by_repo: Mapping[CachedRepoInfo, fro
         for revision in revisions:
             refs = " ".join(sorted(revision.refs)) or "(detached)"
             out.text(f"      {revision.commit_hash} [{refs}] {revision.size_on_disk_str}")
+
+
+def print_protected_blobs_preview(strategy: DeleteCacheStrategy) -> None:
+    """Pretty-print the reference-protection preview of a deletion strategy.
+
+    Lists blobs that would have been deleted but are still referenced by revisions (or files)
+    kept by the plan. Inspecting this preview does not remove anything.
+    """
+    if not strategy.protected_blobs:
+        return
+    out.text("Reference protection preview (these blobs are kept because other revisions still use them):")
+    for info in sorted(strategy.protected_blobs, key=lambda p: str(p.blob_path)):
+        revisions = ", ".join(sorted(info.referencing_revisions))
+        out.text(f"  - {info.blob_path.name} ({_format_size(info.size_on_disk)}) still referenced by: {revisions}")
 
 
 def build_cache_index(
@@ -634,6 +649,7 @@ def rm(
         out.text(f"About to delete {len(resolution.files)} file(s) totalling {strategy.expected_freed_size_str}.")
         for label in sorted(resolution.files.values()):
             out.text(f"  - {label}")
+        print_protected_blobs_preview(strategy)
         if dry_run:
             out.result(
                 "Dry run: no files were deleted.",
@@ -669,6 +685,7 @@ def rm(
     summary_text = " and ".join(summary_parts)
     out.text(f"About to delete {summary_text} totalling {strategy.expected_freed_size_str}.")
     print_cache_selected_revisions(resolution.selected)
+    print_protected_blobs_preview(strategy)
 
     if dry_run:
         out.result(

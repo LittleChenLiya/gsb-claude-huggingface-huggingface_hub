@@ -193,6 +193,7 @@ class TestCacheCommand:
                 return_value=counts,
             ),
             patch("huggingface_hub.cli.cache.print_cache_selected_revisions") as print_mock,
+            patch("huggingface_hub.cli.cache.print_protected_blobs_preview"),
         ):
             result = runner.invoke(app, ["cache", "rm", revision.commit_hash, "--yes"])
 
@@ -218,6 +219,7 @@ class TestCacheCommand:
             patch("huggingface_hub.cli.cache.scan_cache_dir", return_value=hf_cache_info),
             patch("huggingface_hub.cli.cache.build_cache_index", return_value=(repo_lookup, revision_lookup)),
             patch("huggingface_hub.cli.cache.print_cache_selected_revisions"),
+            patch("huggingface_hub.cli.cache.print_protected_blobs_preview"),
         ):
             result = runner.invoke(app, ["cache", "rm", "hf://models/openai-community/gpt2", "--yes"])
 
@@ -248,6 +250,7 @@ class TestCacheCommand:
         with (
             patch("huggingface_hub.cli.cache.scan_cache_dir", return_value=hf_cache_info),
             patch("huggingface_hub.cli.cache.build_cache_index", return_value=({"model/user/model": repo}, {})),
+            patch("huggingface_hub.cli.cache.print_protected_blobs_preview"),
         ):
             result = runner.invoke(app, ["cache", "rm", target, "--yes"])
 
@@ -308,6 +311,7 @@ class TestCacheCommand:
                 return_value=counts,
             ),
             patch("huggingface_hub.cli.cache.print_cache_selected_revisions"),
+            patch("huggingface_hub.cli.cache.print_protected_blobs_preview"),
         ):
             result = runner.invoke(app, ["cache", "rm", revision.commit_hash, "--dry-run"])
 
@@ -341,6 +345,7 @@ class TestCacheCommand:
                 return_value=counts,
             ),
             patch("huggingface_hub.cli.cache.print_cache_selected_revisions") as print_mock,
+            patch("huggingface_hub.cli.cache.print_protected_blobs_preview"),
         ):
             result = runner.invoke(app, ["cache", "prune", "--dry-run"])
 

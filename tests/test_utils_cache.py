@@ -7,7 +7,7 @@ from unittest.mock import Mock
 import pytest
 
 from huggingface_hub._snapshot_download import snapshot_download
-from huggingface_hub.utils import DeleteCacheStrategy, HFCacheInfo, _format_size, scan_cache_dir
+from huggingface_hub.utils import DeleteCacheStrategy, HFCacheInfo, ProtectedBlobInfo, _format_size, scan_cache_dir
 from huggingface_hub.utils._cache_manager import CacheNotFound, _try_delete_path
 
 from .testing_utils import rmtree_with_retry
@@ -517,6 +517,20 @@ class TestDeleteRevisionsDryRun:
             refs=set(),  # No ref deleted since detached
             repos=set(),  # No repo deleted as other revisions exist
             snapshots={Path("repo_A/snapshots_path/repo_A_rev_detached")},
+            protected_blobs=frozenset(
+                {
+                    ProtectedBlobInfo(
+                        blob_path=Path("repo_A/blobs/shared_file_hash"),
+                        size_on_disk=10000,
+                        referencing_revisions=frozenset({"repo_A_rev_main", "repo_A_rev_pr_1"}),
+                    ),
+                    ProtectedBlobInfo(
+                        blob_path=Path("repo_A/blobs/detached_and_pr_1_only_hash"),
+                        size_on_disk=1000,
+                        referencing_revisions=frozenset({"repo_A_rev_pr_1"}),
+                    ),
+                }
+            ),
         )
         assert strategy == expected
 
@@ -531,6 +545,20 @@ class TestDeleteRevisionsDryRun:
             refs={Path("repo_A/refs/refs/pr/1")},  # Ref is deleted !
             repos=set(),  # No repo deleted as other revisions exist
             snapshots={Path("repo_A/snapshots_path/repo_A_rev_pr_1")},
+            protected_blobs=frozenset(
+                {
+                    ProtectedBlobInfo(
+                        blob_path=Path("repo_A/blobs/shared_file_hash"),
+                        size_on_disk=10000,
+                        referencing_revisions=frozenset({"repo_A_rev_main", "repo_A_rev_detached"}),
+                    ),
+                    ProtectedBlobInfo(
+                        blob_path=Path("repo_A/blobs/detached_and_pr_1_only_hash"),
+                        size_on_disk=1000,
+                        referencing_revisions=frozenset({"repo_A_rev_detached"}),
+                    ),
+                }
+            ),
         )
         assert strategy == expected
 
@@ -550,6 +578,15 @@ class TestDeleteRevisionsDryRun:
                 Path("repo_A/snapshots_path/repo_A_rev_detached"),
                 Path("repo_A/snapshots_path/repo_A_rev_pr_1"),
             },
+            protected_blobs=frozenset(
+                {
+                    ProtectedBlobInfo(
+                        blob_path=Path("repo_A/blobs/shared_file_hash"),
+                        size_on_disk=10000,
+                        referencing_revisions=frozenset({"repo_A_rev_main"}),
+                    ),
+                }
+            ),
         )
         assert strategy == expected
 
@@ -604,8 +641,10 @@ class TestDeleteFilesDryRun:
         self.detached_shared = make_file("rev_detached", "shared.bin", "shared_hash", 10)
 
         rev_main = Mock()
+        rev_main.commit_hash = "rev_main"
         rev_main.files = {self.main_shared, self.main_only, self.main_direct}
         rev_detached = Mock()
+        rev_detached.commit_hash = "rev_detached"
         rev_detached.files = {self.detached_shared}
 
         repo_A = Mock()
@@ -629,6 +668,16 @@ class TestDeleteFilesDryRun:
                 Path("repo_A/snapshots/rev_main/main_only.bin"),
                 Path("repo_A/snapshots/rev_main/direct.bin"),
             },
+            protected_blobs=frozenset(
+                {
+                    ProtectedBlobInfo(
+                        blob_path=Path("repo_A/blobs/shared_hash"),
+                        size_on_disk=10,
+                        referencing_revisions=frozenset({"rev_detached"}),
+                        referencing_files=frozenset({Path("repo_A/snapshots/rev_detached/shared.bin")}),
+                    ),
+                }
+            ),
         )
         assert strategy == expected
 
@@ -809,3 +858,156 @@ class TestStringFormatters:
         """Test `_format_size` formatter."""
         for size, expected in self.SIZES.items():
             assert _format_size(size) == expected, f"Wrong formatting for {size} == '{expected}'"
+
+
+class TestReferenceProtectionPreview:
+    """Tests for the reference-protection preview surfaced by `delete_revisions` / `delete_files`.
+
+    The preview lists blobs that would be deleted but are still referenced by revisions (or
+    files) kept by the plan. Inspecting the preview does not remove anything; the blob is only
+    deleted once the last referencing revision is included in a deletion plan and that plan is
+    executed.
+
+    These tests use a mock cache fixture (two revisions sharing one blob) so they are
+    reproducible on any platform, including Windows where symlinks are unavailable.
+    """
+
+    REPO_FOLDER = Path("models--org--shared-blob-demo")
+    REV_A = "a" * 40
+    REV_B = "b" * 40
+    SHARED_BLOB = "shared_blob_hash"
+    ONLY_A_BLOB = "only_a_blob_hash"
+    ONLY_B_BLOB = "only_b_blob_hash"
+    SHARED_SIZE = 1400
+    ONLY_A_SIZE = 500
+    ONLY_B_SIZE = 500
+
+    @pytest.fixture(autouse=True)
+    def setup_cache(self) -> None:
+        """Build a mock cache fixture with two revisions sharing one blob.
+
+        Layout (repo-local blobs):
+            <cache>/models--org--shared-blob-demo/
+                blobs/
+                    shared_blob_hash      <- shared by rev_a and rev_b
+                    only_a_blob_hash      <- only rev_a
+                    only_b_blob_hash      <- only rev_b
+                snapshots/
+                    rev_a/ shared.bin, only_a.bin
+                    rev_b/ shared.bin, only_b.bin
+        """
+        repo = self.REPO_FOLDER
+        blobs = repo / "blobs"
+        snaps = repo / "snapshots"
+
+        def make_file(rev: str, filename: str, blob: str, size: int) -> Mock:
+            f = Mock()
+            f.file_name = filename
+            f.file_path = snaps / rev / filename
+            f.blob_path = blobs / blob
+            f.size_on_disk = size
+            return f
+
+        self.shared_in_a = make_file(self.REV_A, "shared.bin", self.SHARED_BLOB, self.SHARED_SIZE)
+        self.only_a = make_file(self.REV_A, "only_a.bin", self.ONLY_A_BLOB, self.ONLY_A_SIZE)
+        self.shared_in_b = make_file(self.REV_B, "shared.bin", self.SHARED_BLOB, self.SHARED_SIZE)
+        self.only_b = make_file(self.REV_B, "only_b.bin", self.ONLY_B_BLOB, self.ONLY_B_SIZE)
+
+        rev_a = Mock()
+        rev_a.commit_hash = self.REV_A
+        rev_a.snapshot_path = snaps / self.REV_A
+        rev_a.files = frozenset({self.shared_in_a, self.only_a})
+        rev_a.refs = frozenset({"main"})
+
+        rev_b = Mock()
+        rev_b.commit_hash = self.REV_B
+        rev_b.snapshot_path = snaps / self.REV_B
+        rev_b.files = frozenset({self.shared_in_b, self.only_b})
+        rev_b.refs = frozenset({"dev"})
+
+        repo_mock = Mock()
+        repo_mock.repo_id = "org/shared-blob-demo"
+        repo_mock.repo_type = "model"
+        repo_mock.repo_path = repo
+        repo_mock.revisions = frozenset({rev_a, rev_b})
+
+        cache_info = Mock()
+        cache_info.repos = [repo_mock]
+        cache_info.cache_dir = None
+        self.cache_info = cache_info
+
+    def test_preview_lists_shared_blob_protected_by_other_revision(self) -> None:
+        """Deleting rev_a must not remove the shared blob: the preview lists it as protected by rev_b."""
+        strategy = HFCacheInfo.delete_revisions(self.cache_info, self.REV_A)
+
+        # The shared blob is NOT in the deletion set (protected by rev_b); only the rev_a-only blob is.
+        assert strategy.blobs == {self.REPO_FOLDER / "blobs" / self.ONLY_A_BLOB}
+        assert strategy.snapshots == {self.REPO_FOLDER / "snapshots" / self.REV_A}
+        assert strategy.refs == {self.REPO_FOLDER / "refs" / "main"}
+
+        # The reference-protection preview lists the shared blob and the revision that still uses it.
+        protected = strategy.protected_blobs
+        assert len(protected) == 1
+        info = next(iter(protected))
+        assert info.blob_path == self.REPO_FOLDER / "blobs" / self.SHARED_BLOB
+        assert info.size_on_disk == self.SHARED_SIZE
+        assert info.referencing_revisions == frozenset({self.REV_B})
+        assert info.referencing_files == frozenset()
+
+        # The preview is read-only: the shared blob is not in the deletion set.
+        assert self.REPO_FOLDER / "blobs" / self.SHARED_BLOB not in strategy.blobs
+
+    def test_execute_keeps_shared_blob_and_other_revision(self) -> None:
+        """After executing the plan, the shared blob and rev_b are retained (not in the deletion set)."""
+        strategy = HFCacheInfo.delete_revisions(self.cache_info, self.REV_A)
+        strategy.execute()
+
+        # rev_a and its only-a blob are in the deletion set.
+        assert self.REPO_FOLDER / "snapshots" / self.REV_A in strategy.snapshots
+        assert self.REPO_FOLDER / "blobs" / self.ONLY_A_BLOB in strategy.blobs
+        assert self.REPO_FOLDER / "refs" / "main" in strategy.refs
+
+        # The shared blob and rev_b are NOT in any deletion set -> they survive execution.
+        assert self.REPO_FOLDER / "blobs" / self.SHARED_BLOB not in strategy.blobs
+        assert self.REPO_FOLDER / "snapshots" / self.REV_B not in strategy.snapshots
+        assert self.REPO_FOLDER / "refs" / "dev" not in strategy.refs
+
+        # The shared blob is listed as protected, not deleted.
+        assert len(strategy.protected_blobs) == 1
+        assert next(iter(strategy.protected_blobs)).blob_path == self.REPO_FOLDER / "blobs" / self.SHARED_BLOB
+
+    def test_delete_both_revisions_frees_shared_blob(self) -> None:
+        """When the last referencing revision is deleted, the shared blob is freed (no protection)."""
+        strategy = HFCacheInfo.delete_revisions(self.cache_info, self.REV_A, self.REV_B)
+
+        # No protected blobs remain: both revisions referencing the shared blob are being deleted.
+        assert strategy.protected_blobs == frozenset()
+        assert strategy.repos == {self.REPO_FOLDER}
+        assert strategy.blobs == frozenset()
+
+    def test_delete_files_preview_lists_referencing_revision_and_entry(self) -> None:
+        """`delete_files` also surfaces a protection preview with the referencing revision and entry."""
+        strategy = HFCacheInfo.delete_files(self.cache_info, self.shared_in_a)
+
+        # The shared blob is not deleted (still referenced by rev_b); only the rev_a entry is removed.
+        assert strategy.blobs == frozenset()
+        assert strategy.files == {self.REPO_FOLDER / "snapshots" / self.REV_A / "shared.bin"}
+
+        # The preview lists the referencing revision and the exact snapshot entry.
+        protected = strategy.protected_blobs
+        assert len(protected) == 1
+        info = next(iter(protected))
+        assert info.blob_path == self.REPO_FOLDER / "blobs" / self.SHARED_BLOB
+        assert info.size_on_disk == self.SHARED_SIZE
+        assert info.referencing_revisions == frozenset({self.REV_B})
+        assert info.referencing_files == frozenset({self.REPO_FOLDER / "snapshots" / self.REV_B / "shared.bin"})
+
+        # Preview is read-only: the shared blob is not in the deletion set.
+        assert self.REPO_FOLDER / "blobs" / self.SHARED_BLOB not in strategy.blobs
+
+        strategy.execute()
+
+        # Only the rev_a snapshot entry is removed; the shared blob and rev_b survive.
+        assert self.REPO_FOLDER / "snapshots" / self.REV_A / "shared.bin" in strategy.files
+        assert self.REPO_FOLDER / "blobs" / self.SHARED_BLOB not in strategy.blobs
+        assert len(strategy.protected_blobs) == 1

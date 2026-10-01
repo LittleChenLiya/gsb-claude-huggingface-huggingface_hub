@@ -258,6 +258,36 @@ class CachedRepoInfo:
 
 
 @dataclass(frozen=True)
+class ProtectedBlobInfo:
+    """Frozen data structure holding information about a blob protected from deletion.
+
+    A blob is *protected* when a cleanup plan would otherwise delete it but it is still
+    referenced by one or more revisions (or individual snapshot entries) that are not part
+    of the deletion. The protection is computed as a read-only preview: inspecting it does
+    not remove anything. The blob is only deleted once the last referencing revision (or
+    file) is included in a deletion plan and that plan is executed.
+
+    Args:
+        blob_path (`Path`):
+            Path of the blob file that is protected.
+        size_on_disk (`int`):
+            Size of the blob file in bytes.
+        referencing_revisions (`frozenset[str]`):
+            Set of commit hashes of revisions that still reference this blob and therefore
+            protect it from deletion.
+        referencing_files (`frozenset[Path]`, *optional*):
+            Set of snapshot entry paths that still reference this blob. Populated when the
+            preview is computed from [`~utils.HFCacheInfo.delete_files`]; empty for
+            [`~utils.HFCacheInfo.delete_revisions`].
+    """
+
+    blob_path: Path
+    size_on_disk: int
+    referencing_revisions: frozenset[str]
+    referencing_files: frozenset[Path] = frozenset()
+
+
+@dataclass(frozen=True)
 class DeleteCacheStrategy:
     """Frozen data structure holding the strategy to delete cached revisions or files.
 
@@ -282,6 +312,10 @@ class DeleteCacheStrategy:
         cache_dir (`Path` or `None`):
             Cache directory the strategy was computed from. Used to collect shared
             blobs referenced by repo-local symlinks removed by the deletion.
+        protected_blobs (`frozenset[ProtectedBlobInfo]`, *optional*):
+            Read-only preview of blobs that would have been deleted but are still referenced
+            by revisions (or files) kept by the plan. Inspecting this preview does not remove
+            anything; the listed blobs are retained when the strategy is executed.
     """
 
     expected_freed_size: int
@@ -291,6 +325,7 @@ class DeleteCacheStrategy:
     snapshots: frozenset[Path]
     files: frozenset[Path] = frozenset()
     cache_dir: Path | None = None
+    protected_blobs: frozenset[ProtectedBlobInfo] = frozenset()
 
     @property
     def expected_freed_size_str(self) -> str:
@@ -486,6 +521,10 @@ class HFCacheInfo:
         # Blob entries the strategy will unlink (path -> scanned size).
         blobs_to_unlink: dict[Path, int] = {}
 
+        # Read-only preview of blobs that would be deleted but are still referenced by
+        # revisions kept by the plan. Inspecting this does not remove anything.
+        protected_blobs: dict[Path, ProtectedBlobInfo] = {}
+
         for affected_repo, revisions_to_delete in repos_with_revisions.items():
             other_revisions = affected_repo.revisions - revisions_to_delete
 
@@ -497,6 +536,14 @@ class HFCacheInfo:
                     for file in revision.files:
                         blobs_to_unlink[file.blob_path] = file.size_on_disk
                 continue
+
+            # Map of blob_path -> set of revision commit hashes that reference it, built
+            # from the revisions that are NOT being deleted. A blob referenced by any of
+            # these is protected from the cleanup.
+            other_revision_blob_refs: dict[Path, set[str]] = defaultdict(set)
+            for revision in other_revisions:
+                for file in revision.files:
+                    other_revision_blob_refs[file.blob_path].add(revision.commit_hash)
 
             # Some revisions of the repo will be deleted but not all. We need to filter
             # which blob files will not be linked anymore.
@@ -520,19 +567,21 @@ class HFCacheInfo:
                         continue
 
                     if file.blob_path not in delete_strategy_blobs:
-                        is_file_alone = True
-                        for revision in other_revisions:
-                            for rev_file in revision.files:
-                                if file.blob_path == rev_file.blob_path:
-                                    is_file_alone = False
-                                    break
-                            if not is_file_alone:
-                                break
+                        # Check whether the blob is still referenced by revisions kept by the plan.
+                        # If so, it is protected: it must not be removed just because one revision
+                        # using it is cleaned up.
+                        referencing_revisions = other_revision_blob_refs.get(file.blob_path, set())
+                        if referencing_revisions:
+                            protected_blobs[file.blob_path] = ProtectedBlobInfo(
+                                blob_path=file.blob_path,
+                                size_on_disk=file.size_on_disk,
+                                referencing_revisions=frozenset(referencing_revisions),
+                            )
+                            continue
 
                         # Blob file not referenced by remaining revisions -> delete
-                        if is_file_alone:
-                            delete_strategy_blobs.add(file.blob_path)
-                            blobs_to_unlink[file.blob_path] = file.size_on_disk
+                        delete_strategy_blobs.add(file.blob_path)
+                        blobs_to_unlink[file.blob_path] = file.size_on_disk
 
         # Return the strategy instead of executing it.
         return DeleteCacheStrategy(
@@ -542,6 +591,7 @@ class HFCacheInfo:
             snapshots=frozenset(delete_strategy_snapshots),
             expected_freed_size=_expected_freed_size(blobs_to_unlink, self.cache_dir),
             cache_dir=self.cache_dir,
+            protected_blobs=frozenset(protected_blobs.values()),
         )
 
     def delete_files(self, *files: CachedFileInfo) -> DeleteCacheStrategy:
@@ -572,16 +622,34 @@ class HFCacheInfo:
         ```
         """
         selected = set(files)
-        retained_blobs = {
-            file.blob_path
-            for repo in self.repos
-            for revision in repo.revisions
-            for file in revision.files
-            if file not in selected
-        }
-        blobs_to_unlink = {
-            file.blob_path: file.size_on_disk for file in selected if file.blob_path not in retained_blobs
-        }
+
+        # Map of blob_path -> (referencing revision hashes, referencing snapshot entries),
+        # built from files that are NOT part of the deletion. A blob referenced by any of
+        # these is protected from the cleanup.
+        retained_blob_refs: dict[Path, tuple[set[str], set[Path]]] = defaultdict(lambda: (set(), set()))
+        for repo in self.repos:
+            for revision in repo.revisions:
+                for file in revision.files:
+                    if file not in selected:
+                        retained_blob_refs[file.blob_path][0].add(revision.commit_hash)
+                        retained_blob_refs[file.blob_path][1].add(file.file_path)
+
+        blobs_to_unlink: dict[Path, int] = {}
+        protected_blobs: dict[Path, ProtectedBlobInfo] = {}
+        for file in selected:
+            referencing_revisions, referencing_files = retained_blob_refs.get(file.blob_path, (set(), set()))
+            if referencing_revisions:
+                # Blob is still referenced by retained files: it is protected. Inspecting
+                # this preview does not remove anything.
+                protected_blobs[file.blob_path] = ProtectedBlobInfo(
+                    blob_path=file.blob_path,
+                    size_on_disk=file.size_on_disk,
+                    referencing_revisions=frozenset(referencing_revisions),
+                    referencing_files=frozenset(referencing_files),
+                )
+            else:
+                blobs_to_unlink[file.blob_path] = file.size_on_disk
+
         file_paths = frozenset(file.file_path for file in selected)
         return DeleteCacheStrategy(
             expected_freed_size=_expected_freed_size(blobs_to_unlink, self.cache_dir),
@@ -592,6 +660,7 @@ class HFCacheInfo:
             snapshots=frozenset(),
             files=file_paths,
             cache_dir=self.cache_dir,
+            protected_blobs=frozenset(protected_blobs.values()),
         )
 
     def export_as_table(self, *, verbosity: int = 0) -> str:
