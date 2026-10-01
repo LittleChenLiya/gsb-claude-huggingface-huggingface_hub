@@ -258,6 +258,38 @@ class CachedRepoInfo:
 
 
 @dataclass(frozen=True)
+class ProtectedBlobInfo:
+    """Frozen data structure describing a blob protected from deletion by reference protection.
+
+    When planning the deletion of a revision, a blob referenced by that revision is kept as
+    long as another revision that is not part of the deletion plan still references it. This
+    data structure is returned in the deletion strategy preview to report which candidate blob
+    is retained and which revisions protect it.
+
+    Args:
+        blob_path (`Path`):
+            Path of the protected blob file in the repo `blobs` directory.
+        size_on_disk (`int`):
+            Size of the blob file in bytes.
+        referenced_by (`frozenset[str]`):
+            Set of commit hashes of the revisions that still reference the blob and therefore
+            keep it on disk.
+        file_names (`frozenset[str]`):
+            Set of file names under which the blob appears in the protecting revisions.
+    """
+
+    blob_path: Path
+    size_on_disk: int
+    referenced_by: frozenset[str]
+    file_names: frozenset[str]
+
+    @property
+    def size_on_disk_str(self) -> str:
+        """Size of the protected blob as a human-readable string."""
+        return _format_size(self.size_on_disk)
+
+
+@dataclass(frozen=True)
 class DeleteCacheStrategy:
     """Frozen data structure holding the strategy to delete cached revisions or files.
 
@@ -279,6 +311,10 @@ class DeleteCacheStrategy:
         files (`frozenset[Path]`, *optional*):
             Set of individual snapshot entries to be deleted. Their blobs are deleted only if
             listed in `blobs`.
+        protected_blobs (`frozenset[ProtectedBlobInfo]`, *optional*):
+            Set of [`~ProtectedBlobInfo`] describing blobs that the deletion would have
+            removed but that are kept because other, retained revisions still reference them.
+            Empty when no blob benefits from reference protection.
         cache_dir (`Path` or `None`):
             Cache directory the strategy was computed from. Used to collect shared
             blobs referenced by repo-local symlinks removed by the deletion.
@@ -290,6 +326,7 @@ class DeleteCacheStrategy:
     repos: frozenset[Path]
     snapshots: frozenset[Path]
     files: frozenset[Path] = frozenset()
+    protected_blobs: frozenset[ProtectedBlobInfo] = frozenset()
     cache_dir: Path | None = None
 
     @property
@@ -300,6 +337,29 @@ class DeleteCacheStrategy:
         Example: "42.2K".
         """
         return _format_size(self.expected_freed_size)
+
+    def reference_protection_preview(self) -> str:
+        """Render a human-readable preview of the blobs kept by reference protection.
+
+        The preview lists deletion-candidate blobs that are not removed because a retained
+        revision still references them, together with the commit hashes of the protecting
+        revisions. Building the preview does not touch the filesystem: it only reports data
+        collected while computing the strategy.
+
+        Returns:
+            `str`: A multi-line report. An empty string means no blob is protected.
+        """
+        if not self.protected_blobs:
+            return ""
+        lines = ["Reference protection: the following blob(s) are kept because other revisions still use them:"]
+        for protected in sorted(self.protected_blobs, key=lambda info: info.blob_path):
+            revisions = ", ".join(sorted(protected.referenced_by))
+            names = ", ".join(sorted(protected.file_names)) if protected.file_names else "-"
+            lines.append(
+                f"  - {protected.blob_path} ({protected.size_on_disk_str})"
+                f" still referenced by revision(s): {revisions} [file(s): {names}]"
+            )
+        return "\n".join(lines)
 
     def execute(self) -> None:
         """Execute the defined strategy.
@@ -485,6 +545,8 @@ class HFCacheInfo:
 
         # Blob entries the strategy will unlink (path -> scanned size).
         blobs_to_unlink: dict[Path, int] = {}
+        # Blob candidates kept alive by revisions outside the deletion plan (path -> info).
+        protected_blobs: dict[Path, ProtectedBlobInfo] = {}
 
         for affected_repo, revisions_to_delete in repos_with_revisions.items():
             other_revisions = affected_repo.revisions - revisions_to_delete
@@ -496,7 +558,16 @@ class HFCacheInfo:
                 for revision in affected_repo.revisions:
                     for file in revision.files:
                         blobs_to_unlink[file.blob_path] = file.size_on_disk
+                # No blob of a fully-deleted repo can be protected by another revision.
                 continue
+
+            # Index blobs of retained revisions so reference protection is checked in O(1).
+            retained_revisions_by_blob: dict[Path, set[CachedRevisionInfo]] = defaultdict(set)
+            retained_file_names_by_blob: dict[Path, set[str]] = defaultdict(set)
+            for revision in other_revisions:
+                for rev_file in revision.files:
+                    retained_revisions_by_blob[rev_file.blob_path].add(revision)
+                    retained_file_names_by_blob[rev_file.blob_path].add(rev_file.file_name)
 
             # Some revisions of the repo will be deleted but not all. We need to filter
             # which blob files will not be linked anymore.
@@ -520,19 +591,22 @@ class HFCacheInfo:
                         continue
 
                     if file.blob_path not in delete_strategy_blobs:
-                        is_file_alone = True
-                        for revision in other_revisions:
-                            for rev_file in revision.files:
-                                if file.blob_path == rev_file.blob_path:
-                                    is_file_alone = False
-                                    break
-                            if not is_file_alone:
-                                break
+                        protecting_revisions = retained_revisions_by_blob.get(file.blob_path, set())
 
                         # Blob file not referenced by remaining revisions -> delete
-                        if is_file_alone:
+                        if not protecting_revisions:
                             delete_strategy_blobs.add(file.blob_path)
                             blobs_to_unlink[file.blob_path] = file.size_on_disk
+                            continue
+
+                        # Blob is a deletion candidate for this revision but other retained
+                        # revisions still reference it -> keep it and record reference protection.
+                        protected_blobs[file.blob_path] = ProtectedBlobInfo(
+                            blob_path=file.blob_path,
+                            size_on_disk=file.size_on_disk,
+                            referenced_by=frozenset(rev.commit_hash for rev in protecting_revisions),
+                            file_names=frozenset(retained_file_names_by_blob[file.blob_path]),
+                        )
 
         # Return the strategy instead of executing it.
         return DeleteCacheStrategy(
@@ -541,6 +615,7 @@ class HFCacheInfo:
             repos=frozenset(delete_strategy_repos),
             snapshots=frozenset(delete_strategy_snapshots),
             expected_freed_size=_expected_freed_size(blobs_to_unlink, self.cache_dir),
+            protected_blobs=frozenset(protected_blobs.values()),
             cache_dir=self.cache_dir,
         )
 
@@ -572,16 +647,37 @@ class HFCacheInfo:
         ```
         """
         selected = set(files)
-        retained_blobs = {
-            file.blob_path
-            for repo in self.repos
-            for revision in repo.revisions
-            for file in revision.files
-            if file not in selected
-        }
+        # Index every blob that unselected snapshot entries still point to, together with the
+        # revisions and file names that keep it alive.
+        retained_blobs: set[Path] = set()
+        retaining_revisions_by_blob: dict[Path, set[str]] = defaultdict(set)
+        retained_file_names_by_blob: dict[Path, set[str]] = defaultdict(set)
+        for repo in self.repos:
+            for revision in repo.revisions:
+                for file in revision.files:
+                    if file in selected:
+                        continue
+                    retained_blobs.add(file.blob_path)
+                    retaining_revisions_by_blob[file.blob_path].add(revision.commit_hash)
+                    retained_file_names_by_blob[file.blob_path].add(file.file_name)
         blobs_to_unlink = {
             file.blob_path: file.size_on_disk for file in selected if file.blob_path not in retained_blobs
         }
+
+        # Report selected files whose blob is retained because an unselected file still points to it.
+        protected_blobs: dict[Path, ProtectedBlobInfo] = {}
+        for file in selected:
+            if file.blob_path in blobs_to_unlink or file.blob_path in protected_blobs:
+                continue
+            if file.blob_path not in retained_blobs:
+                continue
+            protected_blobs[file.blob_path] = ProtectedBlobInfo(
+                blob_path=file.blob_path,
+                size_on_disk=file.size_on_disk,
+                referenced_by=frozenset(retaining_revisions_by_blob[file.blob_path]),
+                file_names=frozenset(retained_file_names_by_blob[file.blob_path]),
+            )
+
         file_paths = frozenset(file.file_path for file in selected)
         return DeleteCacheStrategy(
             expected_freed_size=_expected_freed_size(blobs_to_unlink, self.cache_dir),
@@ -591,6 +687,7 @@ class HFCacheInfo:
             repos=frozenset(),
             snapshots=frozenset(),
             files=file_paths,
+            protected_blobs=frozenset(protected_blobs.values()),
             cache_dir=self.cache_dir,
         )
 

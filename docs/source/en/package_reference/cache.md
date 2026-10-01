@@ -55,6 +55,12 @@ All structures are built and returned by [`scan_cache_dir`] and are immutable.
 
 [[autodoc]] huggingface_hub.DeleteCacheStrategy
     - expected_freed_size_str
+    - reference_protection_preview
+
+### ProtectedBlobInfo
+
+[[autodoc]] huggingface_hub.ProtectedBlobInfo
+    - size_on_disk_str
 
 ## Exceptions
 

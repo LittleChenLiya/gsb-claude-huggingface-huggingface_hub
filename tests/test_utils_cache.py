@@ -7,7 +7,13 @@ from unittest.mock import Mock
 import pytest
 
 from huggingface_hub._snapshot_download import snapshot_download
-from huggingface_hub.utils import DeleteCacheStrategy, HFCacheInfo, _format_size, scan_cache_dir
+from huggingface_hub.utils import (
+    DeleteCacheStrategy,
+    HFCacheInfo,
+    ProtectedBlobInfo,
+    _format_size,
+    scan_cache_dir,
+)
 from huggingface_hub.utils._cache_manager import CacheNotFound, _try_delete_path
 
 from .testing_utils import rmtree_with_retry
@@ -451,22 +457,27 @@ class TestDeleteRevisionsDryRun:
         main_only_file = Mock()
         main_only_file.blob_path = blobs_path / "main_only_hash"
         main_only_file.size_on_disk = 1
+        main_only_file.file_name = "main_only.bin"
 
         detached_only_file = Mock()
         detached_only_file.blob_path = blobs_path / "detached_only_hash"
         detached_only_file.size_on_disk = 10
+        detached_only_file.file_name = "detached_only.bin"
 
         pr_1_only_file = Mock()
         pr_1_only_file.blob_path = blobs_path / "pr_1_only_hash"
         pr_1_only_file.size_on_disk = 100
+        pr_1_only_file.file_name = "pr_1_only.bin"
 
         detached_and_pr_1_only_file = Mock()
         detached_and_pr_1_only_file.blob_path = blobs_path / "detached_and_pr_1_only_hash"
         detached_and_pr_1_only_file.size_on_disk = 1000
+        detached_and_pr_1_only_file.file_name = "detached_and_pr_1_only.bin"
 
         shared_file = Mock()
         shared_file.blob_path = blobs_path / "shared_file_hash"
         shared_file.size_on_disk = 10000
+        shared_file.file_name = "shared.bin"
 
         # Define revisions
         repo_A_rev_main = Mock()
@@ -517,6 +528,20 @@ class TestDeleteRevisionsDryRun:
             refs=set(),  # No ref deleted since detached
             repos=set(),  # No repo deleted as other revisions exist
             snapshots={Path("repo_A/snapshots_path/repo_A_rev_detached")},
+            protected_blobs={
+                ProtectedBlobInfo(
+                    blob_path=Path("repo_A/blobs/detached_and_pr_1_only_hash"),
+                    size_on_disk=1000,
+                    referenced_by=frozenset({"repo_A_rev_pr_1"}),
+                    file_names=frozenset({"detached_and_pr_1_only.bin"}),
+                ),
+                ProtectedBlobInfo(
+                    blob_path=Path("repo_A/blobs/shared_file_hash"),
+                    size_on_disk=10000,
+                    referenced_by=frozenset({"repo_A_rev_main", "repo_A_rev_pr_1"}),
+                    file_names=frozenset({"shared.bin"}),
+                ),
+            },
         )
         assert strategy == expected
 
@@ -531,6 +556,20 @@ class TestDeleteRevisionsDryRun:
             refs={Path("repo_A/refs/refs/pr/1")},  # Ref is deleted !
             repos=set(),  # No repo deleted as other revisions exist
             snapshots={Path("repo_A/snapshots_path/repo_A_rev_pr_1")},
+            protected_blobs={
+                ProtectedBlobInfo(
+                    blob_path=Path("repo_A/blobs/detached_and_pr_1_only_hash"),
+                    size_on_disk=1000,
+                    referenced_by=frozenset({"repo_A_rev_detached"}),
+                    file_names=frozenset({"detached_and_pr_1_only.bin"}),
+                ),
+                ProtectedBlobInfo(
+                    blob_path=Path("repo_A/blobs/shared_file_hash"),
+                    size_on_disk=10000,
+                    referenced_by=frozenset({"repo_A_rev_main", "repo_A_rev_detached"}),
+                    file_names=frozenset({"shared.bin"}),
+                ),
+            },
         )
         assert strategy == expected
 
@@ -549,6 +588,15 @@ class TestDeleteRevisionsDryRun:
             snapshots={
                 Path("repo_A/snapshots_path/repo_A_rev_detached"),
                 Path("repo_A/snapshots_path/repo_A_rev_pr_1"),
+            },
+            protected_blobs={
+                # shared_file_hash is still used by the retained main revision
+                ProtectedBlobInfo(
+                    blob_path=Path("repo_A/blobs/shared_file_hash"),
+                    size_on_disk=10000,
+                    referenced_by=frozenset({"repo_A_rev_main"}),
+                    file_names=frozenset({"shared.bin"}),
+                ),
             },
         )
         assert strategy == expected
@@ -595,6 +643,7 @@ class TestDeleteFilesDryRun:
             file.file_path = repo_A_path / "snapshots" / revision / name
             file.blob_path = repo_A_path / "blobs" / blob
             file.size_on_disk = size
+            file.file_name = name
             return file
 
         self.main_shared = make_file("rev_main", "shared.bin", "shared_hash", 10)
@@ -604,8 +653,10 @@ class TestDeleteFilesDryRun:
         self.detached_shared = make_file("rev_detached", "shared.bin", "shared_hash", 10)
 
         rev_main = Mock()
+        rev_main.commit_hash = "rev_main"
         rev_main.files = {self.main_shared, self.main_only, self.main_direct}
         rev_detached = Mock()
+        rev_detached.commit_hash = "rev_detached"
         rev_detached.files = {self.detached_shared}
 
         repo_A = Mock()
@@ -628,6 +679,14 @@ class TestDeleteFilesDryRun:
                 Path("repo_A/snapshots/rev_main/shared.bin"),
                 Path("repo_A/snapshots/rev_main/main_only.bin"),
                 Path("repo_A/snapshots/rev_main/direct.bin"),
+            },
+            protected_blobs={
+                ProtectedBlobInfo(
+                    blob_path=Path("repo_A/blobs/shared_hash"),
+                    size_on_disk=10,
+                    referenced_by=frozenset({"rev_detached"}),
+                    file_names=frozenset({"shared.bin"}),
+                ),
             },
         )
         assert strategy == expected
@@ -703,6 +762,225 @@ class TestDeleteStrategyExecute:
         assert not snapshot_2.exists()
         assert file_1.exists()
         assert not file_2.exists()
+
+
+class TestReferenceProtectionOnDiskFixture:
+    """Acceptance tests for cache-cleanup reference protection on a real on-disk cache.
+
+    A fixture cache is built with two revisions of one repo sharing one blob
+    (`shared.bin`), plus one revision-only blob per revision. The cleanup plan must keep
+    the shared blob when a single revision is cleaned, and executing the plan must leave
+    the retained revision fully readable.
+
+    The canonical cache layout uses symlinks (`snapshots/<rev>/<file>` -> `blobs/<etag>`).
+    On systems where the test user cannot create symlinks (e.g. Windows without
+    SeCreateSymbolicLinkPrivilege/Developer Mode), hard links provide the same physical
+    sharing guarantee (several directory entries for one inode); a scanner shim reports
+    those snapshot entries as first-hop links so the regular scan/delete code path runs.
+    """
+
+    REPO_FOLDER = "models--org--ref-protected"
+    REVISION_1 = "1" * 40
+    REVISION_2 = "2" * 40
+    SHARED_PAYLOAD = b"shared blob payload\n" * 16
+    REV1_ONLY_PAYLOAD = b"revision one only payload\n"
+    REV2_ONLY_PAYLOAD = b"revision two only payload\n"
+
+    def _build_fixture(self, tmp_path: Path, mocker) -> tuple[Path, dict[str, Path]]:
+        cache_dir = Path(os.path.abspath(tmp_path / "cache"))
+        repo_path = cache_dir / self.REPO_FOLDER
+        blobs_dir = repo_path / "blobs"
+        blobs_dir.mkdir(parents=True)
+
+        # Probe symlink support for the current user (fails without privilege on Windows).
+        probe = blobs_dir / ".probe_target"
+        probe.write_bytes(b"")
+        try:
+            probe_link = blobs_dir / ".probe_link"
+            probe_link.symlink_to(probe.name)
+            probe_link.unlink()
+            use_symlinks = True
+        except OSError:
+            use_symlinks = False
+        probe.unlink()
+
+        # One shared blob + one revision-only blob per revision.
+        blobs = {
+            "blob_shared": self.SHARED_PAYLOAD,
+            "blob_rev1_only": self.REV1_ONLY_PAYLOAD,
+            "blob_rev2_only": self.REV2_ONLY_PAYLOAD,
+        }
+        for blob_name, payload in blobs.items():
+            (blobs_dir / blob_name).write_bytes(payload)
+
+        # Map of hard-linked snapshot entries -> their emulated readlink target.
+        hardlinked_entries: dict[Path, str] = {}
+
+        def add_revision(commit: str, entries: dict[str, str], ref: str) -> Path:
+            snapshot_dir = repo_path / "snapshots" / commit
+            snapshot_dir.mkdir(parents=True)
+            for filename, blob_name in entries.items():
+                entry = snapshot_dir / filename
+                relative_target = Path(os.path.relpath(blobs_dir / blob_name, start=snapshot_dir))
+                if use_symlinks:
+                    entry.symlink_to(relative_target)
+                else:
+                    # Physical sharing through a hard link; emulate first-hop link reporting.
+                    os.link(blobs_dir / blob_name, entry)
+                    hardlinked_entries[Path(os.path.abspath(entry))] = str(relative_target)
+            ref_path = repo_path / "refs" / ref
+            ref_path.parent.mkdir(parents=True, exist_ok=True)
+            ref_path.write_text(commit)
+            return snapshot_dir
+
+        snapshot_1 = add_revision(
+            self.REVISION_1,
+            {"shared.bin": "blob_shared", "rev1_only.bin": "blob_rev1_only"},
+            ref="main",
+        )
+        snapshot_2 = add_revision(
+            self.REVISION_2,
+            {"shared.bin": "blob_shared", "rev2_only.bin": "blob_rev2_only"},
+            ref=Path("refs") / "pr" / "1",
+        )
+
+        if not use_symlinks:
+            self._patch_hardlinked_snapshot_entries(mocker, hardlinked_entries)
+
+        paths = {
+            "repo": repo_path,
+            "blob_shared": Path(os.path.abspath(blobs_dir / "blob_shared")),
+            "blob_rev1_only": Path(os.path.abspath(blobs_dir / "blob_rev1_only")),
+            "blob_rev2_only": Path(os.path.abspath(blobs_dir / "blob_rev2_only")),
+            "snapshot_1": snapshot_1,
+            "snapshot_2": snapshot_2,
+            "ref_main": repo_path / "refs" / "main",
+            "ref_pr_1": repo_path / "refs" / "refs" / "pr" / "1",
+        }
+        return cache_dir, paths
+
+    @staticmethod
+    def _patch_hardlinked_snapshot_entries(mocker, hardlinked_entries: dict[Path, str]) -> None:
+        """Make hard-linked snapshot entries look like the standard first-hop symlinks."""
+        real_is_symlink = Path.is_symlink
+
+        def fake_is_symlink(self) -> bool:
+            if Path(os.path.abspath(self)) in hardlinked_entries:
+                return True
+            return real_is_symlink(self)
+
+        # Patching with a plain function (not a MagicMock) keeps descriptor binding so `self`
+        # is passed when called as `path.is_symlink()`.
+        mocker.patch.object(Path, "is_symlink", new=fake_is_symlink)
+
+        real_readlink = os.readlink
+
+        def fake_readlink(path, *args, **kwargs):
+            key = Path(os.path.abspath(path))
+            if key in hardlinked_entries:
+                return hardlinked_entries[key]
+            return real_readlink(path, *args, **kwargs)
+
+        mocker.patch("huggingface_hub.utils._cache_manager.os.readlink", side_effect=fake_readlink)
+
+    def test_plan_lists_protection_and_preview_does_not_delete(self, tmp_path: Path, mocker) -> None:
+        cache_dir, paths = self._build_fixture(tmp_path, mocker)
+
+        # Both snapshot entries physically share the same blob inode.
+        assert (paths["snapshot_1"] / "shared.bin").samefile(paths["blob_shared"])
+        assert (paths["snapshot_2"] / "shared.bin").samefile(paths["blob_shared"])
+
+        report = scan_cache_dir(cache_dir)
+        assert report.warnings == []
+        repo = next(iter(report.repos))
+        rev1 = next(rev for rev in repo.revisions if rev.commit_hash == self.REVISION_1)
+        rev2 = next(rev for rev in repo.revisions if rev.commit_hash == self.REVISION_2)
+        shared_in_rev1 = next(f for f in rev1.files if f.file_name == "shared.bin")
+        shared_in_rev2 = next(f for f in rev2.files if f.file_name == "shared.bin")
+        # Scan attributes one and the same blob path to both revisions.
+        assert shared_in_rev1.blob_path == paths["blob_shared"]
+        assert shared_in_rev2.blob_path == paths["blob_shared"]
+
+        # Plan the deletion of revision 1 only.
+        strategy = report.delete_revisions(self.REVISION_1)
+
+        # The revision-only blob is a deletion candidate; the shared blob is not.
+        assert strategy.blobs == {paths["blob_rev1_only"]}
+        assert paths["blob_shared"] not in strategy.blobs
+        assert strategy.snapshots == {paths["snapshot_1"]}
+        assert strategy.refs == {paths["ref_main"]}
+        assert strategy.expected_freed_size == len(self.REV1_ONLY_PAYLOAD)
+
+        # Reference protection preview reports the protecting revision.
+        assert strategy.protected_blobs == frozenset(
+            {
+                ProtectedBlobInfo(
+                    blob_path=paths["blob_shared"],
+                    size_on_disk=len(self.SHARED_PAYLOAD),
+                    referenced_by=frozenset({self.REVISION_2}),
+                    file_names=frozenset({"shared.bin"}),
+                )
+            }
+        )
+        preview = strategy.reference_protection_preview()
+        assert "blob_shared" in preview
+        assert self.REVISION_2 in preview
+        assert self.REVISION_1 not in preview  # protecting revisions only
+
+        # Planning/preview does not touch the filesystem.
+        assert paths["snapshot_1"].exists()
+        assert paths["snapshot_2"].exists()
+        assert paths["blob_shared"].exists()
+        assert paths["blob_rev1_only"].exists()
+        assert paths["ref_main"].exists()
+
+    def test_execute_keeps_shared_blob_and_retained_revision_readable(self, tmp_path: Path, mocker) -> None:
+        cache_dir, paths = self._build_fixture(tmp_path, mocker)
+        report = scan_cache_dir(cache_dir)
+
+        # Execute the single-revision cleanup.
+        report.delete_revisions(self.REVISION_1).execute()
+
+        # Revision 1 artifacts are gone, including its exclusive blob.
+        assert not paths["snapshot_1"].exists()
+        assert not paths["ref_main"].exists()
+        assert not paths["blob_rev1_only"].exists()
+
+        # The multi-reference blob survives and still backs revision 2.
+        assert paths["blob_shared"].exists()
+        assert paths["blob_shared"].read_bytes() == self.SHARED_PAYLOAD
+        retained_shared = paths["snapshot_2"] / "shared.bin"
+        assert retained_shared.exists()
+        assert retained_shared.samefile(paths["blob_shared"])
+        assert retained_shared.read_bytes() == self.SHARED_PAYLOAD
+
+        # The rest of revision 2 is intact and the cache remains valid.
+        assert paths["snapshot_2"].exists()
+        assert paths["blob_rev2_only"].exists()
+        assert paths["ref_pr_1"].exists()
+        rescanned = scan_cache_dir(cache_dir)
+        assert rescanned.warnings == []
+        assert {rev.commit_hash for repo in rescanned.repos for rev in repo.revisions} == {self.REVISION_2}
+
+    def test_shared_blob_freed_once_no_revision_remains(self, tmp_path: Path, mocker) -> None:
+        cache_dir, paths = self._build_fixture(tmp_path, mocker)
+
+        # Delete revision 1: shared blob stays, protected by revision 2.
+        report = scan_cache_dir(cache_dir)
+        strategy_1 = report.delete_revisions(self.REVISION_1)
+        assert paths["blob_shared"] not in strategy_1.blobs
+        strategy_1.execute()
+        assert paths["blob_shared"].exists()
+
+        # Delete the last remaining revision: nothing protects the blob anymore.
+        report = scan_cache_dir(cache_dir)
+        strategy_2 = report.delete_revisions(self.REVISION_2)
+        assert strategy_2.protected_blobs == frozenset()
+        strategy_2.execute()
+
+        # Entire repo (blob included) is removed.
+        assert not paths["repo"].exists()
+        assert not paths["blob_shared"].exists()
 
 
 class TestTryDeletePath:

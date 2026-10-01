@@ -50,6 +50,7 @@ _SUBMOD_ATTRS = {
         "CachedRevisionInfo",
         "DeleteCacheStrategy",
         "HFCacheInfo",
+        "ProtectedBlobInfo",
         "_format_size",
         "scan_cache_dir",
     ],
@@ -291,6 +292,7 @@ if TYPE_CHECKING:  # pragma: no cover
         CachedRevisionInfo,  # noqa: F401
         DeleteCacheStrategy,  # noqa: F401
         HFCacheInfo,  # noqa: F401
+        ProtectedBlobInfo,  # noqa: F401
         _format_size,  # noqa: F401
         scan_cache_dir,  # noqa: F401
     )

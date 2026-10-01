@@ -179,6 +179,7 @@ class TestCacheCommand:
 
         strategy = Mock()
         strategy.expected_freed_size_str = "0B"
+        strategy.protected_blobs = frozenset()
 
         hf_cache_info = Mock()
         hf_cache_info.delete_revisions.return_value = strategy
@@ -210,6 +211,7 @@ class TestCacheCommand:
 
         strategy = Mock()
         strategy.expected_freed_size_str = "0B"
+        strategy.protected_blobs = frozenset()
 
         hf_cache_info = Mock()
         hf_cache_info.delete_revisions.return_value = strategy
@@ -241,6 +243,7 @@ class TestCacheCommand:
 
         strategy = Mock()
         strategy.expected_freed_size_str = "0B"
+        strategy.protected_blobs = frozenset()
 
         hf_cache_info = Mock()
         hf_cache_info.delete_files.return_value = strategy
@@ -294,6 +297,7 @@ class TestCacheCommand:
 
         strategy = Mock()
         strategy.expected_freed_size_str = "0B"
+        strategy.protected_blobs = frozenset()
 
         hf_cache_info = Mock()
         hf_cache_info.delete_revisions.return_value = strategy

@@ -634,6 +634,8 @@ def rm(
         out.text(f"About to delete {len(resolution.files)} file(s) totalling {strategy.expected_freed_size_str}.")
         for label in sorted(resolution.files.values()):
             out.text(f"  - {label}")
+        if strategy.protected_blobs:
+            out.text(strategy.reference_protection_preview())
         if dry_run:
             out.result(
                 "Dry run: no files were deleted.",
@@ -669,6 +671,10 @@ def rm(
     summary_text = " and ".join(summary_parts)
     out.text(f"About to delete {summary_text} totalling {strategy.expected_freed_size_str}.")
     print_cache_selected_revisions(resolution.selected)
+
+    # Reference protection preview: candidate blobs still used by retained revisions stay on disk.
+    if strategy.protected_blobs:
+        out.text(strategy.reference_protection_preview())
 
     if dry_run:
         out.result(
