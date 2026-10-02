@@ -1,5 +1,6 @@
 """Contains all custom errors."""
 
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
@@ -492,12 +493,175 @@ class IncompleteSnapshotError(LocalEntryNotFoundError):
     This is a subclass of [`LocalEntryNotFoundError`] for backward compatibility.
 
     The `snapshot_path` attribute holds the path to the incomplete local snapshot, so a downstream library can locate
-    the latest cached files even though they are known to be incomplete.
+    the latest cached files even though they are known to be incomplete. When the snapshot state has been recorded on
+    disk (i.e. a previous download partially ran), `succeeded_files` and `failed_files` list the repo-relative paths
+    that are respectively available and missing; they are `None` for older caches for which only the tree listing is
+    available.
     """
 
-    def __init__(self, message: str, snapshot_path: str):
+    def __init__(
+        self,
+        message: str,
+        snapshot_path: str,
+        *,
+        succeeded_files: list[str] | None = None,
+        failed_files: list[str] | None = None,
+    ):
         super().__init__(message)
         self.snapshot_path = snapshot_path
+        self.succeeded_files = succeeded_files
+        self.failed_files = failed_files
+
+
+def _reconstruct_snapshot_download_error(
+    message: str,
+    repo_id: str,
+    snapshot_path: str,
+    succeeded_files: list[str],
+    failed_files: list["FailedFileDownload"],
+) -> "SnapshotDownloadError":
+    """Rebuild a [`SnapshotDownloadError`] after a copy/pickle round trip (dynamic error classes are not named)."""
+    return SnapshotDownloadError(
+        message,
+        repo_id=repo_id,
+        snapshot_path=snapshot_path,
+        succeeded_files=succeeded_files,
+        failed_files=failed_files,
+    )
+
+
+class SnapshotDownloadError(Exception):
+    """
+    Raised by [`snapshot_download`] when one or more files could not be downloaded, while other files may have been
+    downloaded successfully.
+
+    Unlike a regular per-file error, this error is raised only after *all* the downloads have been attempted. This
+    means the successfully downloaded files are kept on disk (and listed in `succeeded_files`) and the download can
+    safely be resumed by re-running [`snapshot_download`]: already cached files are skipped and only the files listed
+    in `failed_files` are fetched again.
+
+    For backward compatibility, the error actually raised is also an instance of the first per-file error's class
+    (e.g. a failed download that raised an [`HfHubHTTPError`] still raises an [`HfHubHTTPError`] subclass). The original
+    per-file error is also chained through `__cause__`. Use the concrete [`SnapshotDownloadError`] base class to catch
+    any multi-file snapshot failure regardless of the underlying error.
+
+    Attributes:
+        repo_id (`str`):
+            The repository id for which the download was attempted.
+        snapshot_path (`str`):
+            Path to the local snapshot folder (either the `cache_dir` snapshot folder or the `local_dir`), so a
+            downstream library can locate the files that did get downloaded.
+        succeeded_files (`list[str]`):
+            Repo-relative paths ("/"-separated) of the files that were downloaded successfully.
+        failed_files (`list[FailedFileDownload]`):
+            One entry per file that could not be downloaded, holding its repo-relative path and the original
+            exception raised while downloading it.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        repo_id: str,
+        snapshot_path: str,
+        succeeded_files: list[str],
+        failed_files: list["FailedFileDownload"],
+    ):
+        super().__init__(message)
+        self.repo_id = repo_id
+        self.snapshot_path = snapshot_path
+        self.succeeded_files = succeeded_files
+        self.failed_files = failed_files
+
+    def build(self) -> "SnapshotDownloadError":
+        """Return an instance that is also an instance of the first per-file error's class, when possible.
+
+        Building a dynamic subclass keeps the old behavior intact: code that does
+        `try: snapshot_download(...) except HfHubHTTPError: ...` still catches a failure caused by an
+        [`HfHubHTTPError`], even though several files are now attempted before the error is raised. The dynamic
+        class bypasses the base exception's custom `__init__` (which may require specific arguments, e.g. an HTTP
+        response) and sets `args` directly, like a plain exception. If the dynamic subclass cannot be created
+        (e.g. a non-standard exception class), this plain [`SnapshotDownloadError`] is returned instead.
+        """
+        if not self.failed_files or self.failed_files[0].error is None:
+            return self
+        first_error = self.failed_files[0].error
+        base_class = first_error.__class__
+        if base_class is SnapshotDownloadError or isinstance(self, base_class):
+            return self
+        try:
+            dynamic_class = type(
+                "SnapshotDownloadError",
+                (SnapshotDownloadError, base_class),
+                {
+                    "__module__": SnapshotDownloadError.__module__,
+                    # The base exception may customize pickling/copying (e.g. `HfHubHTTPError.__reduce_ex__` requires
+                    # an HTTP `response`). Reconstruct as a plain `SnapshotDownloadError`: the snapshot attributes
+                    # (succeeded/failed files, ...) survive, which is all callers need after a copy/pickle round trip.
+                    "__reduce_ex__": lambda instance, protocol: (
+                        _reconstruct_snapshot_download_error,
+                        (
+                            str(instance),
+                            instance.repo_id,
+                            instance.snapshot_path,
+                            instance.succeeded_files,
+                            instance.failed_files,
+                        ),
+                    ),
+                },
+            )
+            # Bypass the base exception's custom `__init__` (e.g. `HfHubHTTPError` requires an HTTP response):
+            # create the instance without calling it, then let `BaseException.__init__` record `args` (all that is
+            # needed for `str()`/pickling) and copy over the snapshot attributes.
+            instance = dynamic_class.__new__(dynamic_class)  # type: ignore[call-overload]
+            BaseException.__init__(instance, str(self))
+            instance.repo_id = self.repo_id
+            instance.snapshot_path = self.snapshot_path
+            instance.succeeded_files = self.succeeded_files
+            instance.failed_files = self.failed_files
+        except TypeError:
+            # Non-standard exception class (metaclass conflict, ...): keep the plain error and chain the original
+            # per-file error instead.
+            self.__cause__ = first_error
+            return self
+        # Chain the original per-file error for `raise ... from ...`-style introspection.
+        instance.__cause__ = first_error
+        return instance
+
+
+# FailedFileDownload is defined below the error classes that reference it.
+
+
+@dataclass(frozen=True)
+class FailedFileDownload:
+    """A single file that could not be downloaded during [`snapshot_download`].
+
+    Attributes:
+        path (`str`):
+            Repo-relative path ("/"-separated) of the file that failed to download.
+        error (`Exception` or `None`):
+            The exception that was raised while downloading the file, if available. `None` for failure entries loaded
+            back from disk (see [`huggingface_hub._snapshot_manifest.read_snapshot_manifest`]), for which only the
+            error type name and message are stored.
+        error_type (`str` or `None`):
+            Class name of the original exception (e.g. `"EntryNotFoundError"`), always recorded.
+        error_message (`str` or `None`):
+            String representation of the original exception, always recorded.
+    """
+
+    path: str
+    error: Exception | None = None
+    error_type: str | None = None
+    error_message: str | None = None
+
+    @classmethod
+    def from_error(cls, path: str, error: Exception) -> "FailedFileDownload":
+        return cls(
+            path=path,
+            error=error,
+            error_type=error.__class__.__name__,
+            error_message=str(error),
+        )
 
 
 # REQUEST ERROR

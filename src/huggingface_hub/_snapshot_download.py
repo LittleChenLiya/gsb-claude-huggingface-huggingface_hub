@@ -1,4 +1,5 @@
 import os
+import threading
 from pathlib import Path
 from typing import Literal, overload
 
@@ -7,16 +8,23 @@ from tqdm.auto import tqdm as base_tqdm
 
 from . import constants
 from ._revision import ResolvedRevision
+from ._snapshot_manifest import (
+    SnapshotManifest,
+    read_snapshot_manifest,
+    write_snapshot_manifest,
+)
 from ._tree_cache import TreeCacheEntry, read_tree_cache, tree_cache_folder_for_local_dir, write_tree_cache
 from .errors import (
     CachedRepoTreeNotFoundError,
     DryRunError,
+    FailedFileDownload,
     GatedRepoError,
     HfHubHTTPError,
     IncompleteSnapshotError,
     LocalEntryNotFoundError,
     RepositoryNotFoundError,
     RevisionNotFoundError,
+    SnapshotDownloadError,
 )
 from .file_download import (
     REGEX_COMMIT_HASH,
@@ -220,6 +228,13 @@ def snapshot_download(
             or because it is set to `private` and you do not have access.
         [`~utils.RevisionNotFoundError`]
             If the revision to download from cannot be found.
+        [`~errors.SnapshotDownloadError`]
+            If one or more files could not be downloaded. All the files are attempted before the error is raised;
+            the error holds `snapshot_path` (the partial snapshot folder), `succeeded_files` (the files already
+            downloaded) and `failed_files` (the files that failed, with their original error). Successfully
+            downloaded files are kept on disk and the outcome is recorded in a snapshot manifest, so re-running
+            `snapshot_download` safely resumes the download (cached files are skipped). For backward compatibility,
+            the error is also an instance of the first per-file error's class (e.g. an `HfHubHTTPError`).
         [`~errors.IncompleteSnapshotError`]
             If the Hub cannot be reached (offline, connection issue, or `local_files_only=True`) and the
             cached snapshot is missing some of the requested files.
@@ -431,7 +446,13 @@ def snapshot_download(
                 f"Ignored error while writing commit hash to {os.path.join(storage_folder, 'refs', revision)}: {e}."
             )
 
-    results: list[str | DryRunFileInfo] = []
+    # Outcome of the (possibly parallel) per-file downloads. Every file is attempted even if another one fails:
+    # successfully downloaded files are kept on disk and reported, so re-running `snapshot_download` is a safe resume
+    # (cached files are skipped and only failed files are fetched again).
+    results_by_file: dict[str, str | DryRunFileInfo] = {}
+    succeeded_files: list[str] = []
+    failed_files: list[FailedFileDownload] = []
+    _download_outcome_lock = threading.Lock()
 
     # User can use its own tqdm class or the default one from `huggingface_hub.utils`
     tqdm_class = tqdm_class or hf_tqdm
@@ -508,8 +529,10 @@ def snapshot_download(
     # - file is cached
     # - or xet file with metadata cached in /tree cache
     def _inner_hf_hub_download(repo_file: str) -> None:
-        results.append(
-            hf_hub_download(  # type: ignore
+        # In dry-run mode, keep the old behavior: any per-file error propagates immediately and no outcome
+        # is recorded on disk.
+        if dry_run:
+            results_by_file[repo_file] = hf_hub_download(  # type: ignore
                 repo_id,
                 filename=repo_file,
                 repo_type=repo_type,
@@ -527,7 +550,33 @@ def snapshot_download(
                 tqdm_class=_AggregatedTqdm,  # type: ignore
                 dry_run=dry_run,
             )
-        )
+            return
+        try:
+            result = hf_hub_download(  # type: ignore
+                repo_id,
+                filename=repo_file,
+                repo_type=repo_type,
+                revision=commit_hash,
+                endpoint=endpoint,
+                cache_dir=cache_dir,
+                local_dir=local_dir,
+                library_name=library_name,
+                library_version=library_version,
+                user_agent=user_agent,
+                etag_timeout=etag_timeout,
+                force_download=force_download,
+                token=token,
+                headers=headers,
+                tqdm_class=_AggregatedTqdm,  # type: ignore
+                dry_run=dry_run,
+            )
+        except Exception as error:  # noqa: BLE001 - recorded and re-raised below, after the other files are attempted
+            with _download_outcome_lock:
+                failed_files.append(FailedFileDownload.from_error(repo_file, error))
+            return
+        with _download_outcome_lock:
+            succeeded_files.append(repo_file)
+            results_by_file[repo_file] = result
 
     hf_thread_map(
         _inner_hf_hub_download,
@@ -542,8 +591,62 @@ def snapshot_download(
     reconstruct_progress.set_description("Reconstruction complete")
 
     if dry_run:
-        assert all(isinstance(r, DryRunFileInfo) for r in results)
-        return results  # type: ignore
+        assert all(isinstance(r, DryRunFileInfo) for r in results_by_file.values())
+        return [results_by_file[repo_file] for repo_file in filtered_repo_files]  # type: ignore
+
+    # Reconcile the per-file outcomes with the state of the disk: a file reported as downloaded but missing on disk
+    # (e.g. removed by another process) is counted as a failure. A file that failed but is now present (e.g. a
+    # download that completed after reporting an error) is counted as a success.
+    base_dir = str(local_dir) if local_dir is not None else snapshot_folder
+    reconciled_succeeded: list[str] = []
+    reconciled_failed: list[FailedFileDownload] = []
+    failed_by_path = {failure.path: failure for failure in failed_files}
+    succeeded_set = set(succeeded_files)
+    for repo_file in filtered_repo_files:
+        failure = failed_by_path.get(repo_file)
+        if failure is not None:
+            if _local_file_exists(base_dir, repo_file):
+                # Reported as failed but the file is actually there => trust the disk.
+                reconciled_succeeded.append(repo_file)
+            else:
+                reconciled_failed.append(failure)
+        elif repo_file in succeeded_set and not _local_file_exists(base_dir, repo_file):
+            # Reported as downloaded but the file vanished from disk => treat as a failure.
+            reconciled_failed.append(
+                FailedFileDownload(
+                    path=repo_file,
+                    error=None,
+                    error_type="FileNotFoundError",
+                    error_message=f"File {repo_file} is missing from the snapshot after download.",
+                )
+            )
+        else:
+            reconciled_succeeded.append(repo_file)
+
+    # Record the outcome of this run. A partial snapshot must never be marked as complete: the manifest stores
+    # `completed=False` until every requested file is present.
+    write_snapshot_manifest(
+        tree_cache_folder,
+        commit_hash,
+        succeeded_files=reconciled_succeeded,
+        failed_files=reconciled_failed,
+    )
+
+    if reconciled_failed:
+        sample = ", ".join(failure.path for failure in reconciled_failed[:3])
+        if len(reconciled_failed) > 3:
+            sample += f", ... ({len(reconciled_failed) - 3} more)"
+        snapshot_error = SnapshotDownloadError(
+            f"Failed to download {len(reconciled_failed)} file(s) from '{repo_id}' at commit {commit_hash} "
+            f"({sample}). {len(reconciled_succeeded)} file(s) were downloaded successfully and are kept in "
+            f"'{base_dir}'. Re-run `snapshot_download` to resume: cached files are skipped and only the failed "
+            "files are fetched again.",
+            repo_id=repo_id,
+            snapshot_path=base_dir,
+            succeeded_files=reconciled_succeeded,
+            failed_files=reconciled_failed,
+        ).build()
+        raise snapshot_error
 
     if local_dir is not None:
         return str(os.path.realpath(local_dir))
@@ -561,20 +664,60 @@ def _raise_if_incomplete_snapshot(
     revision: str,
     api_call_error: Exception | None,
 ) -> None:
-    """Raise [`IncompleteSnapshotError`] if the cached tree listing shows `base_dir` misses requested files.
+    """Raise [`IncompleteSnapshotError`] if the snapshot on disk is known to miss requested files.
 
-    If the tree listing is not cached we cannot tell, so we do nothing and the caller keeps returning the
-    folder as-is. Otherwise every expected file (after pattern filtering) must exist under `base_dir`.
+    Completeness is assessed from two on-disk records:
+
+    - The cached tree listing gives the authoritative set of expected files; every requested file must exist under
+      `base_dir`.
+    - The snapshot manifest, if recorded by a previous run, explicitly reports whether that run completed. A folder
+      left behind by a failed (partial) download is never reported as complete, even if the expected files happen to
+      be present.
+
+    If neither record is available, completeness cannot be assessed, so nothing is raised and the caller keeps
+    returning the folder as-is.
     """
     tree_entries = read_tree_cache(tree_cache_folder, commit_hash)
+    manifest = read_snapshot_manifest(tree_cache_folder, commit_hash)
+
+    succeeded_files: list[str] | None = None
+    failed_files: list[str] | None = None
+    if manifest is not None:
+        succeeded_files = manifest.succeeded_files
+        failed_files = manifest.failed_paths
+
     if tree_entries is None:
-        return
-    expected = filter_repo_objects(
-        items=tree_entries.keys(), allow_patterns=allow_patterns, ignore_patterns=ignore_patterns
-    )
-    missing = [path for path in expected if not _local_file_exists(base_dir, path)]
-    if not missing:
-        return
+        # No tree listing to check against: only an explicit manifest can tell the folder is incomplete.
+        if manifest is None or manifest.completed:
+            return
+        missing = [
+            path
+            for path in filter_repo_objects(
+                items=manifest.failed_paths, allow_patterns=allow_patterns, ignore_patterns=ignore_patterns
+            )
+        ]
+        if not missing:
+            return
+    else:
+        missing = [
+            path
+            for path in filter_repo_objects(
+                items=tree_entries.keys(), allow_patterns=allow_patterns, ignore_patterns=ignore_patterns
+            )
+            if not _local_file_exists(base_dir, path)
+        ]
+        # A recorded failure (even if the file happens to be on disk, e.g. copied there manually) keeps the snapshot
+        # marked as incomplete until a successful re-run rewrites the manifest.
+        if manifest is not None and not manifest.completed:
+            missing_set = set(missing)
+            for path in filter_repo_objects(
+                items=manifest.failed_paths, allow_patterns=allow_patterns, ignore_patterns=ignore_patterns
+            ):
+                if path not in missing_set:
+                    missing.append(path)
+                    missing_set.add(path)
+        if not missing:
+            return
 
     sample = ", ".join(missing[:3])
     if len(missing) > 3:
@@ -588,6 +731,8 @@ def _raise_if_incomplete_snapshot(
         f"{len(missing)} file(s) are missing ({sample}). {reason} Re-run the download with network access "
         "to complete the snapshot.",
         snapshot_path=base_dir,
+        succeeded_files=succeeded_files,
+        failed_files=failed_files,
     ) from api_call_error
 
 
@@ -688,6 +833,84 @@ def get_cached_repo_tree(
         RepoFile(path=path, size=entry.size, oid=entry.blob_id, xetHash=entry.xet_hash)
         for path, entry in tree_entries.items()
     ]
+
+
+@validate_hf_hub_args
+def get_snapshot_download_manifest(
+    repo_id: str,
+    *,
+    repo_type: str | None = None,
+    revision: str | None = None,
+    cache_dir: str | Path | None = None,
+    local_dir: str | Path | None = None,
+) -> SnapshotManifest | None:
+    """Return the recorded outcome of the last [`snapshot_download`] for a revision, without any network call.
+
+    The manifest is written to disk after each [`snapshot_download`] run. It reports whether the download completed
+    and, if not, which files were downloaded successfully and which ones failed. This is useful to safely resume a
+    download: inspect `manifest.failed_files` and re-run [`snapshot_download`] to fetch only the missing files (cached
+    files are automatically skipped).
+
+    Args:
+        repo_id (`str`):
+            A user or an organization name and a repo name separated by a `/`.
+        repo_type (`str`, *optional*):
+            Set to `"dataset"`, `"space"` or `"kernel"` for a dataset, space or kernel repo, `None` or `"model"` for
+            a model. Defaults to `None`.
+        revision (`str`, *optional*):
+            An optional Git revision id, which can be a branch name, a tag, or a commit hash. Defaults to the default
+            branch. Branch/tag revisions are resolved to a commit hash using the local cache (`refs/`).
+        cache_dir (`str`, `Path`, *optional*):
+            Path to the folder where cached files are stored. Defaults to the value of `HF_HUB_CACHE`.
+        local_dir (`str` or `Path`, *optional*):
+            If provided, read the manifest recorded by a `local_dir` download (from
+            `local_dir/.cache/huggingface/`) instead of the main cache. Branch/tag revisions are still resolved to a
+            commit hash using the main cache (`cache_dir`).
+
+    Returns:
+        [`SnapshotManifest`] or `None`:
+            The recorded outcome of the last download, or `None` if the repo was never downloaded at this revision
+            (or the outcome was not recorded).
+
+    Example:
+        ```py
+        >>> from huggingface_hub import get_snapshot_download_manifest
+        >>> manifest = get_snapshot_download_manifest("openai-community/gpt2")
+        >>> manifest.completed
+        True
+        >>> manifest.succeeded_files
+        ['.gitattributes', 'config.json', 'model.safetensors', ...]
+        ```
+    """
+    if cache_dir is None:
+        cache_dir = constants.HF_HUB_CACHE
+    cache_dir = str(Path(cache_dir).expanduser().resolve())
+    if local_dir is not None:
+        local_dir = str(Path(local_dir).expanduser().resolve())
+    if revision is None:
+        revision = constants.DEFAULT_REVISION
+    if repo_type is None:
+        repo_type = constants.REPO_TYPE_MODEL
+    if repo_type not in constants.REPO_TYPES_WITH_KERNEL:
+        raise ValueError(
+            f"Invalid repo type: {repo_type}. Accepted repo types are: {str(constants.REPO_TYPES_WITH_KERNEL)}"
+        )
+
+    storage_folder = os.path.join(cache_dir, repo_folder_name(repo_id=repo_id, repo_type=repo_type))
+    tree_cache_folder = tree_cache_folder_for_local_dir(local_dir) if local_dir is not None else storage_folder
+
+    if isinstance(revision, ResolvedRevision):
+        commit_hash = revision.resolved
+    elif REGEX_COMMIT_HASH.fullmatch(revision):
+        commit_hash = revision
+    else:
+        ref_path = os.path.join(storage_folder, "refs", revision)
+        if not os.path.isfile(ref_path):
+            return None
+        with open(ref_path) as f:
+            commit_hash = f.read()
+
+    return read_snapshot_manifest(tree_cache_folder, commit_hash)
 
 
 def _local_file_exists(base_dir: str, path: str) -> bool:

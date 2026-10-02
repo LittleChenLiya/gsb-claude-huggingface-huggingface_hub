@@ -121,6 +121,7 @@ _SUBMOD_ATTRS = {
     ],
     "_snapshot_download": [
         "get_cached_repo_tree",
+        "get_snapshot_download_manifest",
         "snapshot_download",
     ],
     "_space_api": [
@@ -1013,6 +1014,7 @@ __all__ = [
     "get_discussion_details",
     "get_full_repo_name",
     "get_hf_file_metadata",
+    "get_snapshot_download_manifest",
     "get_inference_endpoint",
     "get_local_safetensors_metadata",
     "get_model_tags",
@@ -1317,6 +1319,7 @@ if TYPE_CHECKING:  # pragma: no cover
     )
     from ._snapshot_download import (
         get_cached_repo_tree,  # noqa: F401
+        get_snapshot_download_manifest,  # noqa: F401
         snapshot_download,  # noqa: F401
     )
     from ._space_api import (
