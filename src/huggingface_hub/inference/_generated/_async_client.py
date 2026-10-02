@@ -267,19 +267,31 @@ class AsyncInferenceClient:
         try:
             client = await self._get_async_client()
             if stream:
-                response = await self.exit_stack.enter_async_context(
-                    client.stream(
-                        "POST",
-                        request_parameters.url,
-                        json=request_parameters.json,
-                        data=request_parameters.data,
-                        headers=request_parameters.headers,
-                        cookies=self.cookies,
-                        timeout=self.timeout,
-                    )
+                # Send the request eagerly so that HTTP errors (e.g. HTTP 400 on non-TGI
+                # servers) are raised here and can trigger the retry logic in
+                # `text_generation`. The response is NOT registered in the exit stack:
+                # its lifecycle is owned by `_async_yield_from`, which closes the stream
+                # exactly once when it is fully consumed, when the consumer stops iterating
+                # or when the consuming task is cancelled. Once the first token is yielded,
+                # the stream is started and the retry logic can never resend it.
+                request = client.build_request(
+                    "POST",
+                    request_parameters.url,
+                    json=request_parameters.json,
+                    content=request_parameters.data,
+                    headers=request_parameters.headers,
+                    cookies=self.cookies,
+                    timeout=self.timeout,
                 )
-                hf_raise_for_status(response)
-                return _async_yield_from(client, response)
+                response = await client.send(request, stream=True)
+                try:
+                    hf_raise_for_status(response)
+                except BaseException:
+                    # Release the connection if the status check failed or the task was
+                    # cancelled before the stream was handed over to the caller.
+                    await response.aclose()
+                    raise
+                return _async_yield_from(response)
             else:
                 response = await client.post(
                     request_parameters.url,

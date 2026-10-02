@@ -256,6 +256,19 @@ def _as_dict(response: bytes | dict) -> dict:
 ## STREAMING UTILS
 
 
+async def _async_close_stream(stream: AsyncIterable[Any]) -> None:
+    """Close an async generator underlying a streamed inference response.
+
+    Called when a parsing generator stops (normal end, `[DONE]` signal, error or task
+    cancellation) to propagate the closure to the HTTP stream and release the connection
+    without waiting for the `AsyncInferenceClient` itself to be closed. Closing is a no-op for
+    plain async iterables without an `aclose` method.
+    """
+    aclose = getattr(stream, "aclose", None)
+    if aclose is not None:
+        await aclose()
+
+
 def _stream_text_generation_response(
     output_lines: Iterable[str], details: bool
 ) -> Iterable[str] | Iterable[TextGenerationStreamOutput]:
@@ -274,14 +287,19 @@ async def _async_stream_text_generation_response(
     output_lines: AsyncIterable[str], details: bool
 ) -> AsyncIterable[str] | AsyncIterable[TextGenerationStreamOutput]:
     """Used in `AsyncInferenceClient.text_generation`."""
-    # Parse ServerSentEvents
-    async for line in output_lines:
-        try:
-            output = _format_text_generation_stream_output(line, details)
-        except StopIteration:
-            break
-        if output is not None:
-            yield output
+    # Parse ServerSentEvents. On normal completion, early break, error or cancellation, the
+    # underlying HTTP stream must be closed so that the connection is released. The inner
+    # generator (`_async_yield_from`) makes the close idempotent.
+    try:
+        async for line in output_lines:
+            try:
+                output = _format_text_generation_stream_output(line, details)
+            except StopIteration:
+                break
+            if output is not None:
+                yield output
+    finally:
+        await _async_close_stream(output_lines)
 
 
 def _format_text_generation_stream_output(line: str, details: bool) -> str | TextGenerationStreamOutput | None:
@@ -321,13 +339,18 @@ async def _async_stream_chat_completion_response(
     lines: AsyncIterable[str],
 ) -> AsyncIterable[ChatCompletionStreamOutput]:
     """Used in `AsyncInferenceClient.chat_completion`."""
-    async for line in lines:
-        try:
-            output = _format_chat_completion_stream_output(line)
-        except StopIteration:
-            break
-        if output is not None:
-            yield output
+    # Propagate completion/error/cancellation to the underlying HTTP stream so that the
+    # connection is released. The inner generator (`_async_yield_from`) closes only once.
+    try:
+        async for line in lines:
+            try:
+                output = _format_chat_completion_stream_output(line)
+            except StopIteration:
+                break
+            if output is not None:
+                yield output
+    finally:
+        await _async_close_stream(lines)
 
 
 def _format_chat_completion_stream_output(
@@ -350,9 +373,28 @@ def _format_chat_completion_stream_output(
     return ChatCompletionStreamOutput.parse_obj_as_instance(json_payload)
 
 
-async def _async_yield_from(client: httpx2.AsyncClient, response: httpx2.Response) -> AsyncIterable[str]:
-    async for line in response.aiter_lines():
-        yield line.strip()
+async def _async_yield_from(response: httpx2.Response) -> AsyncIterable[str]:
+    """Iterate over lines of a streamed inference response.
+
+    The response is tied to the lifetime of this async generator. It is closed at most once:
+    - when the stream is fully consumed,
+    - when the consumer breaks out of the iteration,
+    - when the consuming task is cancelled (`asyncio.CancelledError`) or the generator is
+      closed (`GeneratorExit`), e.g. `aclose()` is called explicitly.
+
+    Closing the response eagerly releases the underlying HTTP connection instead of waiting
+    for the whole `AsyncInferenceClient` to be closed. The `_is_closed` flag makes the close
+    procedure idempotent and guarantees it is executed exactly once, even if both the
+    generator cleanup and a manual close are triggered.
+    """
+    _is_closed = False
+    try:
+        async for line in response.aiter_lines():
+            yield line.strip()
+    finally:
+        if not _is_closed:
+            _is_closed = True
+            await response.aclose()
 
 
 # "TGI servers" are servers running with the `text-generation-inference` backend.
