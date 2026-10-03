@@ -44,6 +44,8 @@ from huggingface_hub.inference._common import (
     _get_unsupported_text_generation_kwargs,
     _import_numpy,
     _set_unsupported_text_generation_kwargs,
+    _StreamGenerator,
+    _StreamHandle,
     raise_text_generation_error,
 )
 from huggingface_hub.inference._generated.types import (
@@ -95,8 +97,6 @@ from huggingface_hub.utils import (
     hf_raise_for_status,
     validate_hf_hub_args,
 )
-
-from .._common import _async_yield_from
 
 
 if TYPE_CHECKING:
@@ -267,19 +267,28 @@ class AsyncInferenceClient:
         try:
             client = await self._get_async_client()
             if stream:
-                response = await self.exit_stack.enter_async_context(
-                    client.stream(
-                        "POST",
-                        request_parameters.url,
-                        json=request_parameters.json,
-                        data=request_parameters.data,
-                        headers=request_parameters.headers,
-                        cookies=self.cookies,
-                        timeout=self.timeout,
-                    )
+                # Enter the stream context manually so the streaming generator owns
+                # the response lifecycle: the stream (and connection) is closed
+                # immediately on cancellation, while still being registered in the
+                # exit stack as a fallback for `client.close()`.
+                stream_cm = client.stream(
+                    "POST",
+                    request_parameters.url,
+                    json=request_parameters.json,
+                    data=request_parameters.data,
+                    headers=request_parameters.headers,
+                    cookies=self.cookies,
+                    timeout=self.timeout,
                 )
-                hf_raise_for_status(response)
-                return _async_yield_from(client, response)
+                response = await stream_cm.__aenter__()
+                handle = _StreamHandle(stream_cm, response)
+                try:
+                    hf_raise_for_status(response)
+                except HfHubHTTPError:
+                    await handle.aclose()
+                    raise
+                await self.exit_stack.enter_async_context(handle)
+                return _StreamGenerator(handle, is_async=True)
             else:
                 response = await client.post(
                     request_parameters.url,
@@ -2414,12 +2423,20 @@ class AsyncInferenceClient:
         )
 
         # Handle errors separately for more precise error messages
+        bytes_output = None
         try:
             bytes_output = await self._inner_post(request_parameters, stream=stream or False)
         except HfHubHTTPError as e:
             match = MODEL_KWARGS_NOT_USED_REGEX.search(str(e))
             if isinstance(e, BadRequestError) and match:
                 unused_params = [kwarg.strip("' ") for kwarg in match.group(1).split(",")]
+                # A stream that has already started (first token yielded) must not be
+                # resent: the connection is already committed and resending would
+                # duplicate the partial output. Only retry when the failure happened
+                # before any token was emitted (i.e. during request setup).
+                stream_handle = getattr(bytes_output, "_stream_handle", None)
+                if stream and stream_handle is not None and stream_handle.started:
+                    raise
                 _set_unsupported_text_generation_kwargs(model, unused_params)
                 return await self.text_generation(  # type: ignore
                     prompt=prompt,

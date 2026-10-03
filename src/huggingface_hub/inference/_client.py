@@ -56,6 +56,8 @@ from huggingface_hub.inference._common import (
     _set_unsupported_text_generation_kwargs,
     _stream_chat_completion_response,
     _stream_text_generation_response,
+    _StreamGenerator,
+    _StreamHandle,
     raise_text_generation_error,
 )
 from huggingface_hub.inference._generated.types import (
@@ -255,8 +257,12 @@ class InferenceClient:
             request_parameters.headers["Accept"] = "image/png"
 
         try:
-            response = self.exit_stack.enter_context(
-                get_session().stream(
+            if stream:
+                # Enter the stream context manually so the streaming generator owns
+                # the response lifecycle: the stream (and connection) is closed
+                # immediately when the stream is closed early, while still being
+                # registered in the exit stack as a fallback for `client.close()`.
+                stream_cm = get_session().stream(
                     "POST",
                     request_parameters.url,
                     json=request_parameters.json,
@@ -265,11 +271,28 @@ class InferenceClient:
                     cookies=self.cookies,
                     timeout=self.timeout,
                 )
-            )
-            hf_raise_for_status(response)
-            if stream:
-                return response.iter_lines()
+                response = stream_cm.__enter__()
+                handle = _StreamHandle(stream_cm, response)
+                try:
+                    hf_raise_for_status(response)
+                except HfHubHTTPError:
+                    handle.close()
+                    raise
+                self.exit_stack.enter_context(handle)
+                return _StreamGenerator(handle, is_async=False)
             else:
+                response = self.exit_stack.enter_context(
+                    get_session().stream(
+                        "POST",
+                        request_parameters.url,
+                        json=request_parameters.json,
+                        content=request_parameters.data,
+                        headers=request_parameters.headers,
+                        cookies=self.cookies,
+                        timeout=self.timeout,
+                    )
+                )
+                hf_raise_for_status(response)
                 return response.read()
         except TimeoutError as error:
             # Convert any `TimeoutError` to a `InferenceTimeoutError`
@@ -2368,12 +2391,20 @@ class InferenceClient:
         )
 
         # Handle errors separately for more precise error messages
+        bytes_output = None
         try:
             bytes_output = self._inner_post(request_parameters, stream=stream or False)
         except HfHubHTTPError as e:
             match = MODEL_KWARGS_NOT_USED_REGEX.search(str(e))
             if isinstance(e, BadRequestError) and match:
                 unused_params = [kwarg.strip("' ") for kwarg in match.group(1).split(",")]
+                # A stream that has already started (first token yielded) must not be
+                # resent: the connection is already committed and resending would
+                # duplicate the partial output. Only retry when the failure happened
+                # before any token was emitted (i.e. during request setup).
+                stream_handle = getattr(bytes_output, "_stream_handle", None)
+                if stream and stream_handle is not None and stream_handle.started:
+                    raise
                 _set_unsupported_text_generation_kwargs(model, unused_params)
                 return self.text_generation(  # type: ignore
                     prompt=prompt,

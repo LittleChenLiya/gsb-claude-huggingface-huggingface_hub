@@ -42,7 +42,6 @@ def generate_async_client_code(code: str) -> str:
     # Refactor `.post` method to be async + adapt calls
     code = _make_inner_post_async(code)
     code = _await_inner_post_method_call(code)
-
     # Handle __enter__, __exit__, close
     code = _remove_enter_exit_stack(code)
 
@@ -165,19 +164,28 @@ ASYNC_INNER_POST_CODE = """
         try:
             client = await self._get_async_client()
             if stream:
-                response = await self.exit_stack.enter_async_context(
-                    client.stream(
-                        "POST",
-                        request_parameters.url,
-                        json=request_parameters.json,
-                        data=request_parameters.data,
-                        headers=request_parameters.headers,
-                        cookies=self.cookies,
-                        timeout=self.timeout,
-                    )
+                # Enter the stream context manually so the streaming generator owns
+                # the response lifecycle: the stream (and connection) is closed
+                # immediately on cancellation, while still being registered in the
+                # exit stack as a fallback for `client.close()`.
+                stream_cm = client.stream(
+                    "POST",
+                    request_parameters.url,
+                    json=request_parameters.json,
+                    data=request_parameters.data,
+                    headers=request_parameters.headers,
+                    cookies=self.cookies,
+                    timeout=self.timeout,
                 )
-                hf_raise_for_status(response)
-                return _async_yield_from(client, response)
+                response = await stream_cm.__aenter__()
+                handle = _StreamHandle(stream_cm, response)
+                try:
+                    hf_raise_for_status(response)
+                except HfHubHTTPError:
+                    await handle.aclose()
+                    raise
+                await self.exit_stack.enter_async_context(handle)
+                return _StreamGenerator(handle, is_async=True)
             else:
                 response = await client.post(
                     request_parameters.url,

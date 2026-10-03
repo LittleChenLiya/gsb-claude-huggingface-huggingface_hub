@@ -350,9 +350,134 @@ def _format_chat_completion_stream_output(
     return ChatCompletionStreamOutput.parse_obj_as_instance(json_payload)
 
 
-async def _async_yield_from(client: httpx2.AsyncClient, response: httpx2.Response) -> AsyncIterable[str]:
-    async for line in response.aiter_lines():
-        yield line.strip()
+class _StreamHandle:
+    """Owns the lifecycle of an HTTP streaming response.
+
+    Wraps the ``client.stream(...)`` / ``session.stream(...)`` context manager
+    and guarantees the underlying stream (and connection) is closed exactly
+    once -- whether the stream is fully consumed, closed early, cancelled, or
+    errored. The handle is registered in the client's exit stack as a fallback
+    so closing the client still releases the connection, while the streaming
+    generator closes it immediately on cancellation.
+    """
+
+    def __init__(self, stream_cm: Any, response: httpx2.Response) -> None:
+        self._stream_cm = stream_cm
+        self._response = response
+        self._closed = False
+        self._started = False
+
+    @property
+    def response(self) -> httpx2.Response:
+        return self._response
+
+    @property
+    def started(self) -> bool:
+        """Whether the stream has yielded at least one token."""
+        return self._started
+
+    def mark_started(self) -> None:
+        self._started = True
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self._stream_cm.__exit__(None, None, None)
+
+    async def aclose(self) -> None:
+        if not self._closed:
+            self._closed = True
+            await self._stream_cm.__aexit__(None, None, None)
+
+    def __enter__(self) -> "_StreamHandle":
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        self.close()
+
+    async def __aenter__(self) -> "_StreamHandle":
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        await self.aclose()
+
+
+def _yield_from_stream(handle: _StreamHandle) -> Iterable[str]:
+    """Yield SSE lines from a streaming response, closing the stream when done.
+
+    The stream is closed exactly once when the stream is fully consumed, closed
+    early, or errored. Used by the sync `InferenceClient`.
+    """
+    try:
+        yield from handle.response.iter_lines()
+    finally:
+        handle.close()
+
+
+async def _async_yield_from(handle: _StreamHandle) -> AsyncIterable[str]:
+    """Yield SSE lines from a streaming response, closing the stream on cancellation.
+
+    The stream (and the underlying HTTP connection) is closed exactly once when
+    the stream is fully consumed, closed early, cancelled (e.g. task
+    cancellation or ``aclose()``), or errored. Used by the async
+    `AsyncInferenceClient`.
+    """
+    try:
+        async for line in handle.response.aiter_lines():
+            handle.mark_started()
+            yield line.strip()
+    finally:
+        await handle.aclose()
+
+
+class _StreamGenerator:
+    """Iterator wrapping a streaming response and exposing the stream handle.
+
+    Generators in Python don't support arbitrary attribute assignment, so this
+    wrapper holds the streaming generator and the `_StreamHandle` together,
+    allowing the retry logic to check whether the stream has started (first token
+    yielded) without resending it.
+    """
+
+    def __init__(self, handle: _StreamHandle, *, is_async: bool = False) -> None:
+        self._handle = handle
+        self._is_async = is_async
+        if is_async:
+            self._generator = _async_yield_from(handle)
+        else:
+            self._generator = _yield_from_stream(handle)
+
+    @property
+    def _stream_handle(self) -> _StreamHandle:
+        return self._handle
+
+    def __iter__(self):
+        return self._generator
+
+    def __next__(self):
+        return next(self._generator)
+
+    def __aiter__(self):
+        return self._generator
+
+    async def __anext__(self):
+        return await self._generator.__anext__()
+
+    def close(self) -> None:
+        # Close the handle explicitly in case the generator was never started
+        # (in which case the generator's finally block would not run). The
+        # handle's close is idempotent, so closing it here and in the finally
+        # block is safe.
+        self._handle.close()
+        self._generator.close()
+
+    async def aclose(self) -> None:
+        # Close the handle explicitly in case the generator was never started
+        # (in which case the generator's finally block would not run). The
+        # handle's close is idempotent, so closing it here and in the finally
+        # block is safe.
+        await self._handle.aclose()
+        await self._generator.aclose()
 
 
 # "TGI servers" are servers running with the `text-generation-inference` backend.
